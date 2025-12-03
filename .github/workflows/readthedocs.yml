@@ -15,7 +15,18 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Trigger Read the Docs build
-        uses: readthedocs/actions@v1
-        with:
-          token: ${{ secrets.READTHEDOCS_TOKEN }}
-          project: cellucid
+        env:
+          RTD_TOKEN: ${{ secrets.READTHEDOCS_TOKEN }}
+          RTD_PROJECT: cellucid
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          version="latest"
+          if [ "$REF_TYPE" = "tag" ]; then
+            version="$REF_NAME"
+          fi
+          echo "Triggering Read the Docs build for version ${version}"
+          curl --fail -X POST \
+            -H "Authorization: Token ${RTD_TOKEN}" \
+            "https://readthedocs.org/api/v3/projects/${RTD_PROJECT}/versions/${version}/builds/"

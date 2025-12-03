@@ -1,6 +1,10 @@
-<p align="center">
-  <img src="cellucid-logo.svg" alt="Cellucid logo" width="180">
+<p>
+  <img src="cellucid-logo.svg" alt="Cellucid logo" width="320">
 </p>
+
+[![PyPI version](https://img.shields.io/pypi/v/cellucid.svg)](https://pypi.org/project/cellucid/)
+[![Python versions](https://img.shields.io/pypi/pyversions/cellucid.svg)](https://pypi.org/project/cellucid/)
+[![Documentation Status](https://readthedocs.org/projects/cellucid/badge/?version=latest)](https://cellucid.readthedocs.io/en/latest/)
 
 # cellucid (Python)
 
