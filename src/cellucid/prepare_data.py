@@ -898,6 +898,7 @@ def export_data_for_web(
         print("INFO: No gene expression data provided, skipping var export.")
 
     # Process connectivity data if provided
+    # GPU-optimized edge format for instanced rendering
     if connectivities is not None:
         connectivity_manifest_path = out_dir / connectivity_manifest_filename
         if _file_exists_skip(connectivity_manifest_path, "connectivity manifest", force):
@@ -905,56 +906,115 @@ def export_data_for_web(
         else:
             connectivity_binary_dir = out_dir / connectivity_binary_dirname
             connectivity_binary_dir.mkdir(parents=True, exist_ok=True)
-            
+
             if not sparse.isspmatrix_csr(connectivities):
                 connectivities = sparse.csr_matrix(connectivities)
-            
+
             if connectivities.shape[0] != n_cells or connectivities.shape[1] != n_cells:
                 raise ValueError(
                     f"Connectivity matrix shape {connectivities.shape} does not match "
                     f"number of cells {n_cells}."
                 )
-            
+
+            # Symmetrize and binarize the connectivity matrix
             connectivities_sym = connectivities + connectivities.T
             connectivities_sym.data[:] = 1
             connectivities_csr = connectivities_sym.tocsr()
-            
-            indptr = connectivities_csr.indptr.astype(np.uint32)
-            indices = connectivities_csr.indices.astype(np.uint32)
-            
-            n_edges = len(indices) // 2
-            
-            indptr_fname = "indptr.u32"
-            indices_fname = "indices.u32"
-            indptr_path = connectivity_binary_dir / indptr_fname
-            indices_path = connectivity_binary_dir / indices_fname
-            
-            _write_binary(indptr_path, indptr, compression)
-            _write_binary(indices_path, indices, compression)
-            
-            manifest_indptr = f"{connectivity_binary_dirname}/{indptr_fname}"
-            manifest_indices = f"{connectivity_binary_dirname}/{indices_fname}"
+
+            # Determine optimal dtype based on cell count
+            # uint16: up to 65,535 cells
+            # uint32: up to 4,294,967,295 cells
+            # uint64: up to 18,446,744,073,709,551,615 cells
+            if n_cells <= 65535:
+                index_dtype = np.uint16
+                index_dtype_str = "uint16"
+                index_bytes = 2
+            elif n_cells <= 4294967295:
+                index_dtype = np.uint32
+                index_dtype_str = "uint32"
+                index_bytes = 4
+            else:
+                index_dtype = np.uint64
+                index_dtype_str = "uint64"
+                index_bytes = 8
+
+            indptr = connectivities_csr.indptr
+            indices = connectivities_csr.indices
+
+            # Extract unique edges (src < dst to avoid duplicates)
+            # Using vectorized operations for speed with large datasets
+            print(f"  Extracting unique edges from {n_cells:,} cells...")
+
+            edge_sources = []
+            edge_destinations = []
+            max_neighbors_found = 0
+
+            # Process in chunks for memory efficiency with very large datasets
+            chunk_size = 100000
+            for chunk_start in range(0, n_cells, chunk_size):
+                chunk_end = min(chunk_start + chunk_size, n_cells)
+                for cell_idx in range(chunk_start, chunk_end):
+                    start = indptr[cell_idx]
+                    end = indptr[cell_idx + 1]
+                    neighbor_count = end - start
+                    if neighbor_count > max_neighbors_found:
+                        max_neighbors_found = neighbor_count
+
+                    for j in range(start, end):
+                        neighbor_idx = indices[j]
+                        # Only keep edges where src < dst (avoid duplicates)
+                        if cell_idx < neighbor_idx:
+                            edge_sources.append(cell_idx)
+                            edge_destinations.append(neighbor_idx)
+
+            edge_sources = np.array(edge_sources, dtype=index_dtype)
+            edge_destinations = np.array(edge_destinations, dtype=index_dtype)
+            n_unique_edges = len(edge_sources)
+
+            print(f"  Found {n_unique_edges:,} unique edges, max {max_neighbors_found} neighbors/cell")
+
+            # Sort edges by source, then by destination for optimal gzip compression
+            print(f"  Sorting edges for optimal compression...")
+            sort_idx = np.lexsort((edge_destinations, edge_sources))
+            edge_sources = edge_sources[sort_idx]
+            edge_destinations = edge_destinations[sort_idx]
+
+            # Write binary files (column-separated for better compression)
+            sources_fname = "edges.src.bin"
+            dests_fname = "edges.dst.bin"
+            sources_path = connectivity_binary_dir / sources_fname
+            dests_path = connectivity_binary_dir / dests_fname
+
+            _write_binary(sources_path, edge_sources, compression)
+            _write_binary(dests_path, edge_destinations, compression)
+
+            manifest_sources = f"{connectivity_binary_dirname}/{sources_fname}"
+            manifest_dests = f"{connectivity_binary_dirname}/{dests_fname}"
             if compression:
-                manifest_indptr += ".gz"
-                manifest_indices += ".gz"
-            
+                manifest_sources += ".gz"
+                manifest_dests += ".gz"
+
+            # Write manifest
             connectivity_manifest_payload = {
-                "n_points": int(n_cells),
-                "n_edges": int(n_edges),
-                "nnz": int(len(indices)),
-                "format": "csr",
-                "indptrPath": manifest_indptr,
-                "indicesPath": manifest_indices,
-                "dtype": "uint32",
+                "format": "edge_pairs",
+                "n_cells": int(n_cells),
+                "n_edges": int(n_unique_edges),
+                "max_neighbors": int(max_neighbors_found),
+                "index_bytes": index_bytes,
+                "index_dtype": index_dtype_str,
+                "sourcesPath": manifest_sources,
+                "destinationsPath": manifest_dests,
                 "compression": compression if compression else None,
             }
+
             connectivity_manifest_path.write_text(
                 json.dumps(connectivity_manifest_payload), encoding="utf-8"
             )
-            
+
             print(
-                f"✓ Wrote connectivity manifest ({n_edges:,} unique edges, ~{len(indices)//n_cells:.1f} neighbors/cell) "
-                f"to {connectivity_manifest_path}"
+                f"✓ Wrote connectivity ({n_unique_edges:,} edges, "
+                f"max {max_neighbors_found} neighbors/cell, {index_dtype_str}) "
+                f"to {connectivity_binary_dir}"
             )
     else:
         print("INFO: No connectivity data provided, skipping connectivity export.")
