@@ -32,6 +32,9 @@ DEFAULT_OBS_DIRNAME = "obs"
 DEFAULT_VAR_DIRNAME = "var"
 DEFAULT_CONNECTIVITY_DIRNAME = "connectivity"
 
+# Manifest format version for compact format
+MANIFEST_FORMAT_VERSION = "compact_v1"
+
 
 def _safe_filename_component(name: str) -> str:
     """Return a filesystem-friendly version of a field key."""
@@ -55,18 +58,11 @@ def _file_exists_skip(path: Path, description: str, force: bool = False) -> bool
     return False
 
 
-def _dir_has_files(dir_path: Path, pattern: str = "*") -> bool:
-    """Check if directory has any files matching pattern."""
-    if not dir_path.exists():
-        return False
-    return any(dir_path.glob(pattern))
-
-
 def _write_binary(
     path: Path,
     data: np.ndarray,
     compression: Optional[int] = None,
-) -> None:
+) -> Path:
     """
     Write binary data, optionally with gzip compression.
     
@@ -484,7 +480,8 @@ def export_data_for_web(
 
     # Save points.bin (with existence check)
     points_path = out_dir / points_filename
-    if _file_exists_skip(points_path, "points.bin", force):
+    check_path = Path(str(points_path) + ".gz") if compression and compression > 0 else points_path
+    if _file_exists_skip(check_path, check_path.name, force):
         pass
     else:
         actual_path = _write_binary(points_path, coords3d, compression)
@@ -508,7 +505,12 @@ def export_data_for_web(
     if _file_exists_skip(obs_manifest_path, "obs manifest", force):
         pass
     else:
-        manifest_fields: list[dict] = []
+        # Compact format: separate lists for continuous and categorical fields
+        obs_continuous_fields: list = []
+        obs_categorical_fields: list = []
+        # Track dtype info for schema (will use first encountered)
+        continuous_dtype_info: dict = {}
+        categorical_dtype_info: dict = {}
 
         for key in obs_keys:
             s = obs[key]
@@ -554,40 +556,25 @@ def export_data_for_web(
                     if compression:
                         manifest_path += ".gz"
                     
-                    manifest_fields.append(
-                        {
-                            "key": key,
-                            "kind": "continuous",
-                            "valuesPath": manifest_path,
-                            "valuesDtype": dtype_str,
-                            "quantized": True,
-                            "quantizationBits": obs_continuous_quantization,
-                            "minValue": min_val,
-                            "maxValue": max_val,
-                            "centroids": None,
-                            "outlierQuantilesPath": None,
-                        }
-                    )
+                    # Compact format: [key, minValue, maxValue]
+                    obs_continuous_fields.append([key, min_val, max_val])
+                    if not continuous_dtype_info:
+                        continuous_dtype_info["ext"] = ext
+                        continuous_dtype_info["dtype"] = dtype_str
+                        continuous_dtype_info["quantized"] = True
+                        continuous_dtype_info["quantizationBits"] = obs_continuous_quantization
                 else:
                     # Full precision
                     value_fname = f"{safe_key}.values.f32"
                     value_path = obs_binary_dir / value_fname
                     actual_path = _write_binary(value_path, values, compression)
-                    
-                    manifest_path = f"{obs_binary_dirname}/{value_fname}"
-                    if compression:
-                        manifest_path += ".gz"
-                    
-                    manifest_fields.append(
-                        {
-                            "key": key,
-                            "kind": "continuous",
-                            "valuesPath": manifest_path,
-                            "valuesDtype": "float32",
-                            "centroids": None,
-                            "outlierQuantilesPath": None,
-                        }
-                    )
+
+                    # Compact format: [key]
+                    obs_continuous_fields.append([key])
+                    if not continuous_dtype_info:
+                        continuous_dtype_info["ext"] = "f32"
+                        continuous_dtype_info["dtype"] = "float32"
+                        continuous_dtype_info["quantized"] = False
 
             else:
                 # Categorical
@@ -674,59 +661,72 @@ def export_data_for_web(
                     if compression:
                         manifest_outlier_path += ".gz"
                     
-                    manifest_fields.append(
-                        {
-                            "key": key,
-                            "kind": "category",
-                            "categories": categories,
-                            "codesPath": manifest_codes_path,
-                            "codesDtype": dtype_str,
-                            "codesMissingValue": int(missing_value),
-                            "outlierQuantilesPath": manifest_outlier_path,
-                            "outlierDtype": oq_dtype_str,
-                            "outlierQuantized": True,
-                            "outlierMinValue": oq_min,
-                            "outlierMaxValue": oq_max,
-                            "centroids": centroids,
-                        }
-                    )
+                    # Compact format: [key, categories, codesDtype, codesMissingValue, centroids, outlierMinValue, outlierMaxValue]
+                    obs_categorical_fields.append([
+                        key, categories, dtype_str, int(missing_value), centroids, oq_min, oq_max
+                    ])
+                    if not categorical_dtype_info:
+                        categorical_dtype_info["codesExt"] = "u8" if dtype == np.uint8 else "u16"
+                        categorical_dtype_info["outlierExt"] = oq_ext
+                        categorical_dtype_info["outlierDtype"] = oq_dtype_str
+                        categorical_dtype_info["outlierQuantized"] = True
                 else:
                     # Full precision outliers
                     outlier_fname = f"{safe_key}.outliers.f32"
                     outlier_path = obs_binary_dir / outlier_fname
                     _write_binary(outlier_path, outlier_quantiles.astype(np.float32), compression)
-                    
-                    manifest_outlier_path = f"{obs_binary_dirname}/{outlier_fname}"
-                    if compression:
-                        manifest_outlier_path += ".gz"
-                    
-                    manifest_fields.append(
-                        {
-                            "key": key,
-                            "kind": "category",
-                            "categories": categories,
-                            "codesPath": manifest_codes_path,
-                            "codesDtype": dtype_str,
-                            "codesMissingValue": int(missing_value),
-                            "outlierQuantilesPath": manifest_outlier_path,
-                            "outlierDtype": "float32",
-                            "centroids": centroids,
-                        }
-                    )
+
+                    # Compact format: [key, categories, codesDtype, codesMissingValue, centroids]
+                    obs_categorical_fields.append([
+                        key, categories, dtype_str, int(missing_value), centroids
+                    ])
+                    if not categorical_dtype_info:
+                        categorical_dtype_info["codesExt"] = "u8" if dtype == np.uint8 else "u16"
+                        categorical_dtype_info["outlierExt"] = "f32"
+                        categorical_dtype_info["outlierDtype"] = "float32"
+                        categorical_dtype_info["outlierQuantized"] = False
+
+        # Build compact manifest with schemas
+        gz_suffix = ".gz" if compression else ""
+
+        obs_schemas = {}
+        if continuous_dtype_info:
+            obs_schemas["continuous"] = {
+                "pathPattern": f"{obs_binary_dirname}/{{key}}.values.{continuous_dtype_info['ext']}{gz_suffix}",
+                "ext": continuous_dtype_info["ext"],
+                "dtype": continuous_dtype_info["dtype"],
+                "quantized": continuous_dtype_info.get("quantized", False),
+            }
+            if continuous_dtype_info.get("quantized"):
+                obs_schemas["continuous"]["quantizationBits"] = continuous_dtype_info["quantizationBits"]
+
+        if categorical_dtype_info:
+            obs_schemas["categorical"] = {
+                "codesPathPattern": f"{obs_binary_dirname}/{{key}}.codes.{{ext}}{gz_suffix}",
+                "outlierPathPattern": f"{obs_binary_dirname}/{{key}}.outliers.{categorical_dtype_info['outlierExt']}{gz_suffix}",
+                "outlierExt": categorical_dtype_info["outlierExt"],
+                "outlierDtype": categorical_dtype_info["outlierDtype"],
+                "outlierQuantized": categorical_dtype_info.get("outlierQuantized", False),
+            }
 
         obs_manifest_payload = {
+            "_format": MANIFEST_FORMAT_VERSION,
             "n_points": int(n_cells),
             "centroid_outlier_quantile": float(centroid_outlier_quantile)
             if centroid_outlier_quantile is not None
             else None,
             "latent_key": "latent_space",
             "compression": compression if compression else None,
-            "fields": manifest_fields,
+            "_obsSchemas": obs_schemas,
+            "_continuousFields": obs_continuous_fields,
+            "_categoricalFields": obs_categorical_fields,
         }
         obs_manifest_path.write_text(json.dumps(obs_manifest_payload), encoding="utf-8")
 
+        total_fields = len(obs_continuous_fields) + len(obs_categorical_fields)
         print(
-            f"✓ Wrote obs manifest ({len(manifest_fields)} fields) to {obs_manifest_path} "
+            f"✓ Wrote obs manifest ({total_fields} fields: {len(obs_continuous_fields)} continuous, "
+            f"{len(obs_categorical_fields)} categorical) to {obs_manifest_path} "
             f"with binaries in {obs_binary_dirname}/"
         )
 
@@ -832,36 +832,16 @@ def export_data_for_web(
                     if compression:
                         manifest_path += ".gz"
                     
-                    var_manifest_fields.append(
-                        {
-                            "key": gene_id,
-                            "kind": "continuous",
-                            "valuesPath": manifest_path,
-                            "valuesDtype": dtype_str,
-                            "quantized": True,
-                            "quantizationBits": var_quantization,
-                            "minValue": min_val,
-                            "maxValue": max_val,
-                        }
-                    )
+                    # Compact format: [key, minValue, maxValue]
+                    var_manifest_fields.append([gene_id, min_val, max_val])
                 else:
                     # Full precision
                     value_fname = f"{safe_gene_id}.values.f32"
                     value_path = var_binary_dir / value_fname
                     _write_binary(value_path, values, compression)
-                    
-                    manifest_path = f"{var_binary_dirname}/{value_fname}"
-                    if compression:
-                        manifest_path += ".gz"
-                    
-                    var_manifest_fields.append(
-                        {
-                            "key": gene_id,
-                            "kind": "continuous",
-                            "valuesPath": manifest_path,
-                            "valuesDtype": "float32",
-                        }
-                    )
+
+                    # Compact format: [key] for non-quantized
+                    var_manifest_fields.append([gene_id])
             
             # Report aggregated gene stats
             if genes_with_nan:
@@ -879,11 +859,35 @@ def export_data_for_web(
                 if len(genes_all_invalid) <= 10:
                     print(f"    Genes: {', '.join(genes_all_invalid)}")
             
+            # Build compact manifest with schema
+            gz_suffix = ".gz" if compression else ""
+            if var_quantization is not None:
+                ext = "u8" if var_quantization == 8 else "u16"
+                dtype_str = "uint8" if var_quantization == 8 else "uint16"
+                var_schema = {
+                    "kind": "continuous",
+                    "pathPattern": f"{var_binary_dirname}/{{key}}.values.{ext}{gz_suffix}",
+                    "ext": ext,
+                    "dtype": dtype_str,
+                    "quantized": True,
+                    "quantizationBits": var_quantization,
+                }
+            else:
+                var_schema = {
+                    "kind": "continuous",
+                    "pathPattern": f"{var_binary_dirname}/{{key}}.values.f32{gz_suffix}",
+                    "ext": "f32",
+                    "dtype": "float32",
+                    "quantized": False,
+                }
+
             var_manifest_payload = {
+                "_format": MANIFEST_FORMAT_VERSION,
                 "n_points": int(n_cells),
                 "var_gene_id_column": var_gene_id_column,
                 "compression": compression if compression else None,
                 "quantization": var_quantization,
+                "_varSchema": var_schema,
                 "fields": var_manifest_fields,
             }
             var_manifest_path.write_text(json.dumps(var_manifest_payload), encoding="utf-8")
