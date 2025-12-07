@@ -17,9 +17,11 @@ Instead of AnnData, accepts:
 - connectivities: sparse matrix with KNN connectivities
 """
 import gzip
+import hashlib
 import json
 import re
 import tqdm
+from datetime import datetime
 from pathlib import Path
 from typing import Optional, Sequence, Union, Literal
 
@@ -41,6 +43,17 @@ def _safe_filename_component(name: str) -> str:
     safe = re.sub(r"[^A-Za-z0-9._-]+", "_", str(name))
     safe = safe.strip("._")
     return safe or "field"
+
+
+def _sha256_json(obj: object) -> str:
+    """Stable sha256 over a JSON-serializable object."""
+    normalized = json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+
+
+def _sha256_list_str(items: Sequence[str]) -> str:
+    """Convenience hash for lists of strings."""
+    return _sha256_json([str(x) for x in items])
 
 
 def _to_dense(arr: Union[np.ndarray, sparse.spmatrix]) -> np.ndarray:
@@ -500,6 +513,63 @@ def export_data_for_web(
                 f"Available columns: {list(obs.columns)}"
             )
 
+    # Collect lightweight metadata for obs fields (used in dataset hash)
+    obs_field_summaries: list[dict] = []
+    genes_to_export: list[str] = []
+    gene_ids_hash: Optional[str] = None
+    for key in obs_keys:
+        s = obs[key]
+        if pd.api.types.is_categorical_dtype(s):
+            kind = "category"
+        elif pd.api.types.is_bool_dtype(s):
+            kind = "category"
+        elif pd.api.types.is_numeric_dtype(s):
+            kind = "continuous"
+        else:
+            kind = "category"
+
+        if kind == "continuous":
+            if obs_continuous_quantization is None:
+                dtype_str = "float32"
+            elif obs_continuous_quantization == 8:
+                dtype_str = "uint8"
+            else:
+                dtype_str = "uint16"
+            obs_field_summaries.append(
+                {
+                    "key": str(key),
+                    "kind": "continuous",
+                    "quantized": obs_continuous_quantization is not None,
+                    "quantization_bits": int(obs_continuous_quantization)
+                    if obs_continuous_quantization is not None
+                    else None,
+                    "dtype": dtype_str,
+                }
+            )
+        else:
+            cat = s.astype("category")
+            categories = [str(c) for c in cat.cat.categories]
+            n_categories = len(categories)
+            if obs_categorical_dtype == "auto":
+                dtype_str = "uint8" if n_categories <= 254 else "uint16"
+            elif obs_categorical_dtype == "uint8":
+                dtype_str = "uint8"
+            else:
+                dtype_str = "uint16"
+            obs_field_summaries.append(
+                {
+                    "key": str(key),
+                    "kind": "category",
+                    "category_count": n_categories,
+                    "categories_hash": _sha256_list_str(categories),
+                    "codes_dtype": dtype_str,
+                    "outlier_quantized": obs_continuous_quantization is not None,
+                    "outlier_quantization_bits": int(obs_continuous_quantization)
+                    if obs_continuous_quantization is not None
+                    else None,
+                }
+            )
+
     # Check if obs manifest already exists
     obs_manifest_path = out_dir / obs_manifest_filename
     if _file_exists_skip(obs_manifest_path, "obs manifest", force):
@@ -731,84 +801,89 @@ def export_data_for_web(
         )
 
     # Process gene expression if provided
+    genes_to_export: list[str] = []
+    gene_ids_hash: Optional[str] = None
     if gene_expression is not None:
         if var is None:
             raise ValueError("var DataFrame must be provided when gene_expression is given.")
-        
+
+        gene_expr_is_sparse = sparse.issparse(gene_expression)
+        gene_expression_for_export = (
+            gene_expression.tocsc() if gene_expr_is_sparse and not sparse.isspmatrix_csc(gene_expression) else gene_expression
+        )
+
+        n_expr_cells = gene_expression_for_export.shape[0]
+        n_genes = gene_expression_for_export.shape[1]
+
+        if n_expr_cells != n_cells:
+            raise ValueError(
+                f"gene_expression has {n_expr_cells} cells, but X_umap has {n_cells} cells."
+            )
+
+        if len(var) != n_genes:
+            raise ValueError(
+                f"var has {len(var)} rows, but gene_expression has {n_genes} genes."
+            )
+
+        if var_gene_id_column == "index":
+            all_gene_ids = var.index.astype(str).tolist()
+        else:
+            if var_gene_id_column not in var.columns:
+                raise KeyError(
+                    f"var_gene_id_column '{var_gene_id_column}' not found in var. "
+                    f"Available columns: {list(var.columns)}"
+                )
+            all_gene_ids = var[var_gene_id_column].astype(str).tolist()
+
+        gene_id_to_idx = {gid: idx for idx, gid in enumerate(all_gene_ids)}
+
+        if gene_identifiers is None:
+            genes_to_export = all_gene_ids
+        else:
+            genes_to_export = list(gene_identifiers)
+            missing_genes = [g for g in genes_to_export if g not in gene_id_to_idx]
+            if missing_genes:
+                print(f"⚠ Warning: {len(missing_genes)} gene identifiers not found in var: {missing_genes[:5]}...")
+            genes_to_export = [g for g in genes_to_export if g in gene_id_to_idx]
+
+        gene_ids_hash = _sha256_list_str(genes_to_export)
+
         var_manifest_path = out_dir / var_manifest_filename
         if _file_exists_skip(var_manifest_path, "var manifest", force):
             pass
         else:
             var_binary_dir = out_dir / var_binary_dirname
             var_binary_dir.mkdir(parents=True, exist_ok=True)
-            
-            gene_expr_is_sparse = sparse.issparse(gene_expression)
-            if gene_expr_is_sparse and not sparse.isspmatrix_csc(gene_expression):
-                gene_expression = gene_expression.tocsc()
-            
-            n_expr_cells = gene_expression.shape[0]
-            n_genes = gene_expression.shape[1]
-            
-            if n_expr_cells != n_cells:
-                raise ValueError(
-                    f"gene_expression has {n_expr_cells} cells, but X_umap has {n_cells} cells."
-                )
-            
-            if len(var) != n_genes:
-                raise ValueError(
-                    f"var has {len(var)} rows, but gene_expression has {n_genes} genes."
-                )
-            
-            if var_gene_id_column == "index":
-                all_gene_ids = var.index.astype(str).tolist()
-            else:
-                if var_gene_id_column not in var.columns:
-                    raise KeyError(
-                        f"var_gene_id_column '{var_gene_id_column}' not found in var. "
-                        f"Available columns: {list(var.columns)}"
-                    )
-                all_gene_ids = var[var_gene_id_column].astype(str).tolist()
-            
-            gene_id_to_idx = {gid: idx for idx, gid in enumerate(all_gene_ids)}
-            
-            if gene_identifiers is None:
-                genes_to_export = all_gene_ids
-            else:
-                genes_to_export = list(gene_identifiers)
-                missing_genes = [g for g in genes_to_export if g not in gene_id_to_idx]
-                if missing_genes:
-                    print(f"⚠ Warning: {len(missing_genes)} gene identifiers not found in var: {missing_genes[:5]}...")
-                genes_to_export = [g for g in genes_to_export if g in gene_id_to_idx]
-            
+
             var_manifest_fields: list[dict] = []
-            
+
             # Track problematic genes for aggregated reporting
             genes_with_nan: list[str] = []
             genes_with_inf: list[str] = []
             genes_all_invalid: list[str] = []
-            
+
             for gene_id in tqdm.tqdm(genes_to_export, desc="Exporting genes"):
                 gene_idx = gene_id_to_idx[gene_id]
                 safe_gene_id = _safe_filename_component(gene_id)
-                
+
                 if gene_expr_is_sparse:
-                    col = gene_expression.getcol(gene_idx).toarray().flatten()
+                    col = gene_expression_for_export.getcol(gene_idx).toarray().flatten()
                 else:
-                    col = gene_expression[:, gene_idx]
-                
+                    col = gene_expression_for_export[:, gene_idx]
+
                 values = np.asarray(col, dtype=np.float32)
-                
+
                 if values.shape[0] != n_cells:
                     raise ValueError(
                         f"Gene '{gene_id}' expression length mismatch: {values.shape[0]} vs {n_cells}"
                     )
-                
+
                 # Apply quantization if requested
                 if var_quantization is not None:
                     quantized, min_val, max_val, scale, stats = _quantize_continuous(
                         values, bits=var_quantization, field_name=gene_id
                     )
-                    
+
                     # Track aggregated stats for genes (don't spam per-gene)
                     if stats.get("n_nan", 0) > 0:
                         genes_with_nan.append(gene_id)
@@ -816,22 +891,22 @@ def export_data_for_web(
                         genes_with_inf.append(gene_id)
                     if stats.get("warning") == "all_invalid":
                         genes_all_invalid.append(gene_id)
-                    
+
                     if var_quantization == 8:
                         dtype_str = "uint8"
                         ext = "u8"
                     else:
                         dtype_str = "uint16"
                         ext = "u16"
-                    
+
                     value_fname = f"{safe_gene_id}.values.{ext}"
                     value_path = var_binary_dir / value_fname
                     _write_binary(value_path, quantized, compression)
-                    
+
                     manifest_path = f"{var_binary_dirname}/{value_fname}"
                     if compression:
                         manifest_path += ".gz"
-                    
+
                     # Compact format: [key, minValue, maxValue]
                     var_manifest_fields.append([gene_id, min_val, max_val])
                 else:
@@ -842,7 +917,7 @@ def export_data_for_web(
 
                     # Compact format: [key] for non-quantized
                     var_manifest_fields.append([gene_id])
-            
+
             # Report aggregated gene stats
             if genes_with_nan:
                 print(f"  ⚠ {len(genes_with_nan)} genes contain NaN values (mapped to missing marker)")
@@ -858,7 +933,7 @@ def export_data_for_web(
                 print(f"  ⚠ WARNING: {len(genes_all_invalid)} genes have NO valid values (all NaN/Inf)")
                 if len(genes_all_invalid) <= 10:
                     print(f"    Genes: {', '.join(genes_all_invalid)}")
-            
+
             # Build compact manifest with schema
             gz_suffix = ".gz" if compression else ""
             if var_quantization is not None:
@@ -891,7 +966,7 @@ def export_data_for_web(
                 "fields": var_manifest_fields,
             }
             var_manifest_path.write_text(json.dumps(var_manifest_payload), encoding="utf-8")
-            
+
             compression_info = f", gzip level {compression}" if compression else ""
             quant_info = f", {var_quantization}-bit quantized" if var_quantization else ""
             print(
@@ -903,8 +978,41 @@ def export_data_for_web(
 
     # Process connectivity data if provided
     # GPU-optimized edge format for instanced rendering
+    connectivity_meta = {
+        "n_edges": None,
+        "max_neighbors": None,
+        "index_dtype": None,
+    }
     if connectivities is not None:
         connectivity_manifest_path = out_dir / connectivity_manifest_filename
+        if connectivities.shape[0] != n_cells or connectivities.shape[1] != n_cells:
+            raise ValueError(
+                f"Connectivity matrix shape {connectivities.shape} does not match "
+                f"number of cells {n_cells}."
+            )
+
+        # Determine optimal dtype based on cell count up front (used in hash even if we skip writing)
+        if n_cells <= 65535:
+            index_dtype = np.uint16
+            index_dtype_str = "uint16"
+            index_bytes = 2
+        elif n_cells <= 4294967295:
+            index_dtype = np.uint32
+            index_dtype_str = "uint32"
+            index_bytes = 4
+        else:
+            index_dtype = np.uint64
+            index_dtype_str = "uint64"
+            index_bytes = 8
+
+        approx_edges = None
+        if sparse.issparse(connectivities):
+            approx_edges = int(connectivities.nnz // 2)
+        else:
+            approx_edges = int(np.count_nonzero(connectivities) // 2)
+        connectivity_meta["n_edges"] = approx_edges
+        connectivity_meta["index_dtype"] = index_dtype_str
+
         if _file_exists_skip(connectivity_manifest_path, "connectivity manifest", force):
             pass
         else:
@@ -914,33 +1022,10 @@ def export_data_for_web(
             if not sparse.isspmatrix_csr(connectivities):
                 connectivities = sparse.csr_matrix(connectivities)
 
-            if connectivities.shape[0] != n_cells or connectivities.shape[1] != n_cells:
-                raise ValueError(
-                    f"Connectivity matrix shape {connectivities.shape} does not match "
-                    f"number of cells {n_cells}."
-                )
-
             # Symmetrize and binarize the connectivity matrix
             connectivities_sym = connectivities + connectivities.T
             connectivities_sym.data[:] = 1
             connectivities_csr = connectivities_sym.tocsr()
-
-            # Determine optimal dtype based on cell count
-            # uint16: up to 65,535 cells
-            # uint32: up to 4,294,967,295 cells
-            # uint64: up to 18,446,744,073,709,551,615 cells
-            if n_cells <= 65535:
-                index_dtype = np.uint16
-                index_dtype_str = "uint16"
-                index_bytes = 2
-            elif n_cells <= 4294967295:
-                index_dtype = np.uint32
-                index_dtype_str = "uint32"
-                index_bytes = 4
-            else:
-                index_dtype = np.uint64
-                index_dtype_str = "uint64"
-                index_bytes = 8
 
             indptr = connectivities_csr.indptr
             indices = connectivities_csr.indices
@@ -974,6 +1059,9 @@ def export_data_for_web(
             edge_sources = np.array(edge_sources, dtype=index_dtype)
             edge_destinations = np.array(edge_destinations, dtype=index_dtype)
             n_unique_edges = len(edge_sources)
+            connectivity_meta["n_edges"] = int(n_unique_edges)
+            connectivity_meta["max_neighbors"] = int(max_neighbors_found)
+            connectivity_meta["index_dtype"] = index_dtype_str
 
             print(f"  Found {n_unique_edges:,} unique edges, max {max_neighbors_found} neighbors/cell")
 
@@ -1022,3 +1110,58 @@ def export_data_for_web(
             )
     else:
         print("INFO: No connectivity data provided, skipping connectivity export.")
+
+    # --- Dataset signature for clash detection ---------------------------------
+    obs_fields_hash = _sha256_json(obs_field_summaries)
+    gene_count = len(genes_to_export) if genes_to_export else 0
+
+    hash_inputs = {
+        "version": 1,
+        "manifest_format": MANIFEST_FORMAT_VERSION,
+        "n_cells": int(n_cells),
+        "latent_dims": int(latent.shape[1]),
+        "obs_keys": [str(k) for k in obs_keys],
+        "obs_fields_hash": obs_fields_hash,
+        "obs_fields": obs_field_summaries,
+        "obs_continuous_quantization": obs_continuous_quantization,
+        "obs_categorical_dtype": obs_categorical_dtype,
+        "var_present": gene_expression is not None,
+        "gene_count": gene_count,
+        "gene_list_hash": gene_ids_hash,
+        "var_gene_id_column": var_gene_id_column if gene_expression is not None else None,
+        "var_quantization": var_quantization,
+        "connectivity": connectivity_meta,
+        "compression": compression if compression else None,
+        "points_filename": points_filename + (".gz" if compression else ""),
+        "obs_manifest": obs_manifest_filename,
+        "var_manifest": var_manifest_filename if gene_expression is not None else None,
+        "connectivity_manifest": connectivity_manifest_filename if connectivities is not None else None,
+        "centroid_outlier_quantile": centroid_outlier_quantile if centroid_outlier_quantile is not None else None,
+        "centroid_min_points": centroid_min_points,
+    }
+
+    signature = _sha256_json(hash_inputs)
+    dataset_hash_payload = {
+        "version": 1,
+        "created_at": datetime.utcnow().isoformat() + "Z",
+        "signature": signature,
+        "summary": {
+            "n_cells": int(n_cells),
+            "obs_field_count": len(obs_field_summaries),
+            "obs_keys": [str(k) for k in obs_keys],
+            "obs_fields_hash": obs_fields_hash,
+            "gene_count": gene_count,
+            "gene_list_hash": gene_ids_hash,
+            "compression": compression if compression else None,
+            "connectivity_edges": connectivity_meta.get("n_edges"),
+        },
+        "details": {
+            "hash_inputs": hash_inputs,
+            "gene_sample": genes_to_export[:10] if genes_to_export else [],
+            "notes": "signature is sha256 over hash_inputs; compare two dataset_hash.json files to diagnose clashes",
+        },
+    }
+
+    dataset_hash_path = out_dir / "dataset_hash.json"
+    dataset_hash_path.write_text(json.dumps(dataset_hash_payload, ensure_ascii=True, indent=2), encoding="utf-8")
+    print(f"✓ Wrote dataset signature (hash={signature[:12]}...) to {dataset_hash_path}")
