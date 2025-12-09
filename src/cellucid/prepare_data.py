@@ -20,6 +20,7 @@ import gzip
 import json
 import re
 import tqdm
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional, Sequence, Union, Literal
 
@@ -387,6 +388,13 @@ def export_data_for_web(
     obs_continuous_quantization: Optional[int] = None,
     obs_categorical_dtype: Literal["auto", "uint8", "uint16"] = "auto",
     compression: Optional[int] = None,
+    # Dataset metadata parameters (for dataset_identity.json)
+    dataset_name: Optional[str] = None,
+    dataset_description: Optional[str] = None,
+    dataset_id: Optional[str] = None,
+    source_name: Optional[str] = None,
+    source_url: Optional[str] = None,
+    source_citation: Optional[str] = None,
 ) -> None:
     """
     Export raw data arrays to files used by the WebGL viewer.
@@ -436,6 +444,23 @@ def export_data_for_web(
         Minimum number of points in a category to compute a centroid.
     force : bool
         If True, overwrite existing files. If False, skip files that already exist.
+
+    Dataset Metadata Parameters
+    ---------------------------
+    dataset_name : str, optional
+        Human-readable name for the dataset (e.g., "Human Lung Cell Atlas").
+        If not provided, defaults to the output directory name.
+    dataset_description : str, optional
+        Description of the dataset.
+    dataset_id : str, optional
+        Unique identifier for the dataset. If not provided, a filesystem-safe
+        version of the dataset_name is used.
+    source_name : str, optional
+        Name of the data source (e.g., "HLCA Consortium").
+    source_url : str, optional
+        URL to the data source.
+    source_citation : str, optional
+        Citation text for the data source.
     """
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -500,10 +525,8 @@ def export_data_for_web(
                 f"Available columns: {list(obs.columns)}"
             )
 
-    # Collect lightweight metadata for obs fields (used in dataset hash)
+    # Collect lightweight metadata for obs fields (used in dataset identity)
     obs_field_summaries: list[dict] = []
-    genes_to_export: list[str] = []
-    gene_ids_hash: Optional[str] = None
     for key in obs_keys:
         s = obs[key]
         if pd.api.types.is_categorical_dtype(s):
@@ -1093,3 +1116,208 @@ def export_data_for_web(
             )
     else:
         print("INFO: No connectivity data provided, skipping connectivity export.")
+
+    # =========================================================================
+    # Generate dataset_identity.json (metadata for multi-dataset support)
+    # =========================================================================
+    identity_path = out_dir / "dataset_identity.json"
+
+    # Try to import version from package
+    try:
+        from cellucid import __version__ as cellucid_version
+    except ImportError:
+        cellucid_version = "unknown"
+
+    # Determine dataset ID and name
+    if dataset_id is None:
+        if dataset_name:
+            dataset_id = _safe_filename_component(dataset_name)
+        else:
+            dataset_id = _safe_filename_component(out_dir.name)
+
+    if dataset_name is None:
+        dataset_name = out_dir.name
+
+    # Count genes
+    n_genes = 0
+    if gene_expression is not None and var is not None:
+        if sparse.issparse(gene_expression):
+            n_genes = gene_expression.shape[1]
+        else:
+            n_genes = np.asarray(gene_expression).shape[1]
+
+    # Count obs fields from the obs_field_summaries list populated earlier (lines 528-582)
+    # This works regardless of whether the obs manifest was written or skipped
+    n_obs_fields = len(obs_field_summaries)
+    n_categorical_fields = sum(1 for f in obs_field_summaries if f.get("kind") == "category")
+    n_continuous_fields = sum(1 for f in obs_field_summaries if f.get("kind") == "continuous")
+
+    # Validate that field counts add up (sanity check)
+    if n_obs_fields != n_categorical_fields + n_continuous_fields:
+        print(
+            f"  ⚠ WARNING: Field count mismatch! "
+            f"n_obs_fields={n_obs_fields}, categorical={n_categorical_fields}, continuous={n_continuous_fields}"
+        )
+        # Debug: show fields with unexpected kinds
+        unexpected = [f for f in obs_field_summaries if f.get("kind") not in ("category", "continuous")]
+        if unexpected:
+            print(f"    Fields with unexpected kind: {[f.get('key') for f in unexpected]}")
+
+    # Convert obs_field_summaries to the format expected in dataset_identity.json
+    # (simplified version with just key, kind, and n_categories for categorical)
+    identity_obs_fields = []
+    for field_info in obs_field_summaries:
+        entry = {
+            "key": field_info["key"],
+            "kind": field_info["kind"]
+        }
+        if field_info["kind"] == "category" and "category_count" in field_info:
+            entry["n_categories"] = field_info["category_count"]
+        identity_obs_fields.append(entry)
+
+    # Build source info if provided
+    source_info = None
+    if source_name or source_url or source_citation:
+        source_info = {}
+        if source_name:
+            source_info["name"] = source_name
+        if source_url:
+            source_info["url"] = source_url
+        if source_citation:
+            source_info["citation"] = source_citation
+
+    # Build export settings
+    export_settings = {
+        "compression": compression if compression else None,
+        "var_quantization": var_quantization,
+        "obs_continuous_quantization": obs_continuous_quantization,
+        "obs_categorical_dtype": obs_categorical_dtype
+    }
+
+    # Build identity payload
+    identity_payload = {
+        "version": 1,
+        "id": dataset_id,
+        "name": dataset_name,
+        "description": dataset_description or "",
+        "created_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "cellucid_data_version": cellucid_version,
+        "stats": {
+            "n_cells": int(n_cells),
+            "n_genes": int(n_genes),
+            "n_obs_fields": int(n_obs_fields),
+            "n_categorical_fields": int(n_categorical_fields),
+            "n_continuous_fields": int(n_continuous_fields),
+            "has_connectivity": connectivity_meta.get("n_edges") is not None,
+            "n_edges": connectivity_meta.get("n_edges")
+        },
+        "obs_fields": identity_obs_fields,
+        "export_settings": export_settings
+    }
+
+    if source_info:
+        identity_payload["source"] = source_info
+
+    identity_path.write_text(json.dumps(identity_payload, indent=2), encoding="utf-8")
+    print(f"✓ Wrote dataset identity to {identity_path}")
+
+
+def generate_datasets_manifest(
+    exports_dir: Union[str, Path] = DEFAULT_EXPORT_DIR,
+    output_filename: str = "datasets.json",
+    default_dataset: Optional[str] = None,
+) -> Optional[Path]:
+    """
+    Scan an exports directory for dataset_identity.json files and generate a datasets.json manifest.
+
+    This utility helps maintain the datasets.json manifest file that the frontend uses
+    to discover available demo datasets. Run this after adding or removing datasets.
+
+    Parameters
+    ----------
+    exports_dir : Path or str
+        Directory containing dataset subdirectories (default: exports/).
+    output_filename : str
+        Name of the output manifest file (default: datasets.json).
+    default_dataset : str or None
+        ID of the default dataset. If None, uses the first dataset found.
+
+    Returns
+    -------
+    Path
+        Path to the generated datasets.json file.
+
+    Example
+    -------
+    >>> from cellucid.prepare_data import generate_datasets_manifest
+    >>> generate_datasets_manifest("./exports", default_dataset="my_dataset")
+    """
+    exports_dir = Path(exports_dir)
+    if not exports_dir.exists():
+        raise FileNotFoundError(f"Exports directory not found: {exports_dir}")
+
+    print(f"Scanning {exports_dir} for datasets...")
+
+    datasets = []
+
+    # Scan subdirectories for dataset_identity.json
+    for subdir in sorted(exports_dir.iterdir()):
+        if not subdir.is_dir():
+            continue
+
+        identity_file = subdir / "dataset_identity.json"
+        if not identity_file.exists():
+            print(f"  ⚠ Skipping {subdir.name}: no dataset_identity.json")
+            continue
+
+        try:
+            identity = json.loads(identity_file.read_text(encoding="utf-8"))
+
+            dataset_entry = {
+                "id": identity.get("id", subdir.name),
+                "path": f"{subdir.name}/",
+                "name": identity.get("name", subdir.name),
+            }
+
+            # Include quick stats for display in dropdown
+            stats = identity.get("stats", {})
+            if stats.get("n_cells"):
+                dataset_entry["n_cells"] = stats["n_cells"]
+            if stats.get("n_genes"):
+                dataset_entry["n_genes"] = stats["n_genes"]
+
+            datasets.append(dataset_entry)
+            print(f"  ✓ Found dataset: {dataset_entry['name']} ({dataset_entry['id']})")
+
+        except json.JSONDecodeError as e:
+            print(f"  ⚠ Skipping {subdir.name}: invalid JSON - {e}")
+        except Exception as e:
+            print(f"  ⚠ Skipping {subdir.name}: {e}")
+
+    if not datasets:
+        print("  No datasets found!")
+        return None
+
+    # Determine default dataset
+    if default_dataset:
+        if not any(d["id"] == default_dataset for d in datasets):
+            print(f"  ⚠ Warning: default_dataset '{default_dataset}' not found, using first dataset")
+            default_dataset = datasets[0]["id"]
+    else:
+        default_dataset = datasets[0]["id"]
+
+    # Build manifest
+    manifest = {
+        "version": 1,
+        "default": default_dataset,
+        "datasets": datasets
+    }
+
+    # Write manifest
+    manifest_path = exports_dir / output_filename
+    manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+
+    print(f"✓ Wrote datasets manifest with {len(datasets)} datasets to {manifest_path}")
+    print(f"  Default dataset: {default_dataset}")
+
+    return manifest_path
