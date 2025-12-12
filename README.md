@@ -33,7 +33,7 @@ The package name is `cellucid` and imports under `cellucid`.
 ## Usage
 ```python
 import scanpy as sc
-from cellucid.prepare_data import export_data_for_web
+from cellucid import export_data_for_web
 
 adata = sc.read_h5ad("path/to/adata.h5ad")
 export_data_for_web(
