@@ -54,8 +54,50 @@ For production use or sharing, export to optimized binary format:
 ```python
 from cellucid import prepare, show
 
-# Export once (quantized + compressed)
-prepare(adata, output_dir="./my_export", compress=True)
+# Pick UMAP embeddings (explicit keys preferred, fall back to X_umap).
+X_umap_1d = adata.obsm.get("X_umap_1d")
+X_umap_2d = adata.obsm.get("X_umap_2d")
+X_umap_3d = adata.obsm.get("X_umap_3d")
+X_umap = adata.obsm.get("X_umap")  # may be 1D/2D/3D depending on how it was computed
+if X_umap is not None and X_umap_1d is None and X_umap.shape[1] == 1:
+    X_umap_1d = X_umap
+if X_umap is not None and X_umap_2d is None and X_umap.shape[1] == 2:
+    X_umap_2d = X_umap
+if X_umap is not None and X_umap_3d is None and X_umap.shape[1] == 3:
+    X_umap_3d = X_umap
+
+# Optional: include any per-cell displacement vector fields in embedding space
+# (see "Vector Field Overlay" section below for naming conventions).
+vector_fields = {
+    "velocity_umap_2d": adata.obsm.get("velocity_umap_2d"),
+    "velocity_umap_3d": adata.obsm.get("velocity_umap_3d"),
+}
+
+prepare(
+    # Required inputs
+    latent_space=adata.obsm.get(
+        "X_pca",
+        X_umap_3d if X_umap_3d is not None else (X_umap_2d if X_umap_2d is not None else X_umap_1d),
+    ),
+    obs=adata.obs,
+    var=adata.var,
+    gene_expression=adata.X,
+
+    # Optional inputs
+    connectivities=adata.obsp.get("connectivities"),
+    vector_fields=vector_fields,
+
+    # Embeddings (provide any/all of 1D/2D/3D)
+    X_umap_1d=X_umap_1d,
+    X_umap_2d=X_umap_2d,
+    X_umap_3d=X_umap_3d,
+
+    # Output + performance knobs
+    out_dir="./my_export",
+    compression=6,
+    var_quantization=8,
+    obs_continuous_quantization=8,
+)
 
 # View anytime (fastest loading)
 show("./my_export")
@@ -72,9 +114,31 @@ adata.obsm['X_umap_2d']  # shape (n_cells, 2)
 adata.obsm['X_umap']     # shape (n_cells, 2 or 3)
 
 # Optional
+adata.obsm['velocity_umap_2d']  # shape (n_cells, 2) - vector field overlay (velocity/drift)
 adata.obs                # Cell metadata (categorical/continuous)
 adata.X                  # Gene expression (dense or sparse)
 adata.obsp['connectivities']  # KNN graph edges
+```
+
+### Vector Field Overlay (Velocity / CellRank Drift)
+
+Cellucid’s web viewer can render an animated particle-flow overlay from **per-cell displacement vectors** in embedding space.
+
+Store vectors in `adata.obsm` with keys like:
+- `velocity_umap_2d`, `velocity_umap_3d`
+- `T_fwd_umap_2d`, `T_bwd_umap_2d` (CellRank-style drift)
+
+If you have a CellRank transition matrix `T` and an embedding `X_umap`, you can derive drift vectors:
+
+```python
+from cellucid import add_transition_drift_to_obsm
+
+add_transition_drift_to_obsm(
+    adata,
+    T_fwd,                # (n_cells, n_cells) sparse/dense transition matrix
+    basis="umap",
+    field_prefix="T_fwd", # -> writes adata.obsm['T_fwd_umap_<dim>d']
+)
 ```
 
 Computing 3D UMAP with scanpy:

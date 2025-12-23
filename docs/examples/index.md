@@ -58,6 +58,13 @@ Multi-dimensional UMAP export for the Miller dataset.
 Multi-dimensional UMAP export for the Suo dataset.
 :::
 
+:::{grid-item-card} {octicon}`beaker;1.5em;sd-mr-1` CellRank (_test)
+:link: prepare_cellrank_pseudotime_test
+:link-type: doc
+
+Real dataset from CellRank with a pseudotime-kernel drift vector field exported to `assets/exports/_test`.
+:::
+
 ::::
 
 ---
@@ -101,4 +108,5 @@ prepare_he
 prepare_kanemaru
 prepare_miller
 prepare_suo
+prepare_cellrank_pseudotime_test
 ```

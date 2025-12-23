@@ -20,7 +20,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - Multiple deployment modes:
   - Local demo (browser-only)
   - Browser file picker (h5ad and exported formats)
-  - Server CLI (`cellucid serve`, `cellucid serve-anndata`)
+  - Server CLI (`cellucid serve`)
   - Python API (`serve()`, `serve_anndata()`)
   - Jupyter integration (`show()`, `show_anndata()`)
 - Export functionality for web deployment

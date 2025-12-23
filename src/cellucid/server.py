@@ -94,7 +94,6 @@ class CORSRequestHandler(CORSMixin, SimpleHTTPRequestHandler):
                 "status": "ok",
                 "type": "exported",
                 "version": self.server_info.get("version", "unknown"),
-                "data_dir": str(self.data_dir),
             })
             return
 
@@ -227,8 +226,6 @@ class CellucidServer:
 
         self._server: HTTPServer | None = None
         self._thread: threading.Thread | None = None
-        self._ws_server = None
-        self._ws_task = None
         self._running = False
 
         # Version from package
@@ -239,7 +236,6 @@ class CellucidServer:
 
         self.server_info = {
             "version": __version__,
-            "data_dir": str(self.data_dir),
             "host": self.host,
             "port": self.port,
             "mode": "standalone",
@@ -395,82 +391,3 @@ def serve(
         quiet=quiet,
     )
     server.start()
-
-
-def main():
-    """CLI entry point for cellucid serve (legacy, kept for direct imports)."""
-    import argparse
-
-    parser = argparse.ArgumentParser(
-        description="Serve a cellucid dataset directory",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-    # Serve a local dataset
-    cellucid serve /path/to/my_dataset
-
-    # Serve on a different port
-    cellucid serve /path/to/data --port 9000
-
-    # Serve on all interfaces (for remote access)
-    cellucid serve /path/to/data --host 0.0.0.0
-
-    # For SSH tunnel access from remote server:
-    # On the server: cellucid serve /path/to/data
-    # On local machine: ssh -L 8765:localhost:8765 user@server
-    # Then open: https://www.cellucid.com?remote=http://localhost:8765
-""",
-    )
-
-    parser.add_argument(
-        "data_dir",
-        type=str,
-        help="Path to the dataset directory",
-    )
-    parser.add_argument(
-        "--port", "-p",
-        type=int,
-        default=DEFAULT_PORT,
-        help=f"Port to serve on (default: {DEFAULT_PORT})",
-    )
-    parser.add_argument(
-        "--host", "-H",
-        type=str,
-        default=DEFAULT_HOST,
-        help=f"Host to bind to (default: {DEFAULT_HOST})",
-    )
-    parser.add_argument(
-        "--no-browser",
-        action="store_true",
-        help="Don't open browser automatically",
-    )
-    parser.add_argument(
-        "--quiet", "-q",
-        action="store_true",
-        help="Suppress info messages",
-    )
-    parser.add_argument(
-        "--verbose", "-v",
-        action="store_true",
-        help="Enable verbose logging",
-    )
-
-    args = parser.parse_args()
-
-    # Configure logging
-    if args.verbose:
-        logging.basicConfig(level=logging.DEBUG)
-    elif not args.quiet:
-        logging.basicConfig(level=logging.INFO)
-
-    serve(
-        data_dir=args.data_dir,
-        port=args.port,
-        host=args.host,
-        open_browser=not args.no_browser,
-        quiet=args.quiet,
-    )
-
-
-if __name__ == "__main__":
-    main()

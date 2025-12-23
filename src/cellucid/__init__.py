@@ -64,6 +64,14 @@ def __getattr__(name):
         from .anndata_adapter import AnnDataAdapter
         return AnnDataAdapter
 
+    # Vector field utilities (CellRank drift, etc.)
+    if name == "compute_transition_drift":
+        from .vector_fields import compute_transition_drift
+        return compute_transition_drift
+    if name == "add_transition_drift_to_obsm":
+        from .vector_fields import add_transition_drift_to_obsm
+        return add_transition_drift_to_obsm
+
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 __all__ = [
@@ -84,6 +92,10 @@ __all__ = [
     "serve_anndata",
     "AnnDataServer",
     "AnnDataAdapter",
+
+    # Vector field utilities
+    "compute_transition_drift",
+    "add_transition_drift_to_obsm",
 
     # Version
     "__version__",

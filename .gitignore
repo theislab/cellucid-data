@@ -40,3 +40,4 @@ docs/_autosummary/
 data/raw/**
 data/experiments/**
 project_context.txt
+/docs/examples/datasets

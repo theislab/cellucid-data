@@ -9,7 +9,8 @@ Includes memory/disk optimization features:
 
 Instead of AnnData, accepts:
 - latent_space: (n_cells, n_dims) numpy/sparse array for outlier quantile calculation
-- X_umap: (n_cells, 3) numpy array for 3D UMAP coordinates
+- X_umap_1d / X_umap_2d / X_umap_3d: explicit embeddings (at least one required)
+- vector_fields: dict[str, array] of per-cell displacement vectors (optional)
 - obs: pandas DataFrame with cell metadata columns
 - var: pandas DataFrame with gene/feature metadata
 - gene_expression: (n_cells, n_genes) numpy/sparse array for gene expression matrix
@@ -386,7 +387,6 @@ def _compute_latent_space_quantiles(
 
 
 def prepare(
-    X_umap: Optional[np.ndarray] = None,
     latent_space: Optional[Union[np.ndarray, sparse.spmatrix]] = None,
     obs: Optional[pd.DataFrame] = None,
     var: Optional[pd.DataFrame] = None,
@@ -405,7 +405,7 @@ def prepare(
     connectivity_manifest_filename: str = "connectivity_manifest.json",
     connectivity_binary_dirname: str = DEFAULT_CONNECTIVITY_DIRNAME,
     force: bool = False,
-    # Optimization parameters (all disabled by default for backward compatibility)
+    # Optimization parameters (all disabled by default)
     var_quantization: Optional[int] = None,
     obs_continuous_quantization: Optional[int] = None,
     obs_categorical_dtype: Literal["auto", "uint8", "uint16"] = "auto",
@@ -422,6 +422,9 @@ def prepare(
     X_umap_2d: Optional[np.ndarray] = None,
     X_umap_3d: Optional[np.ndarray] = None,
     X_umap_4d: Optional[np.ndarray] = None,
+    # Optional per-cell vector fields aligned to the embedding(s)
+    # (e.g. scVelo velocity, CellRank drift vectors)
+    vector_fields: Optional[dict[str, Union[np.ndarray, sparse.spmatrix]]] = None,
 ) -> None:
     """
     Export raw data arrays to files used by the WebGL viewer.
@@ -453,9 +456,6 @@ def prepare(
     used for all axes to preserve aspect ratios. This ensures each dimension
     fills the viewing area optimally without requiring manual zoom adjustment.
 
-    X_umap : np.ndarray, optional (deprecated, use X_umap_3d instead)
-        Legacy 3D UMAP coordinates, shape (n_cells, 3). For backward compatibility.
-        If provided without X_umap_3d, it will be used as X_umap_3d.
     X_umap_1d : np.ndarray, optional
         1D embedding coordinates, shape (n_cells, 1). Stored as points_1d.bin.
     X_umap_2d : np.ndarray, optional
@@ -466,6 +466,16 @@ def prepare(
     X_umap_4d : np.ndarray, optional
         4D embedding coordinates, shape (n_cells, 4). Stored as points_4d.bin.
         NOTE: 4D visualization is not yet implemented in the viewer.
+
+    vector_fields : dict[str, np.ndarray] or None
+        Optional per-cell displacement vectors aligned to the embedding space.
+        Keys follow the same naming convention as AnnData `obsm`:
+        - Explicit: `<field>_umap_<dim>d` (e.g. `velocity_umap_2d`, `T_fwd_umap_3d`)
+        - Implicit: `<field>_umap` with shape `(n_cells, 1|2|3)`
+          (used only if the explicit key for that dim is not provided)
+
+        Each value must be shaped `(n_cells, dim)` (or `(n_cells,)` for 1D).
+        Vectors are scaled by the SAME per-dimension normalization scale as points.
 
     Standard Parameters
     -------------------
@@ -511,8 +521,6 @@ def prepare(
     source_citation : str, optional
         Citation text for the data source.
     """
-    import warnings
-
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     obs_binary_dir = out_dir / obs_binary_dirname
@@ -525,16 +533,6 @@ def prepare(
     # =========================================================================
     # MULTI-DIMENSIONAL EMBEDDING VALIDATION & PROCESSING
     # =========================================================================
-    # Handle backward compatibility: X_umap maps to X_umap_3d
-    if X_umap is not None and X_umap_3d is None:
-        warnings.warn(
-            "The 'X_umap' parameter is deprecated and will be removed in a future version. "
-            "Use 'X_umap_3d' instead for 3D UMAP coordinates.",
-            DeprecationWarning,
-            stacklevel=2
-        )
-        X_umap_3d = X_umap
-
     # Collect all provided embeddings
     embeddings: dict[int, np.ndarray] = {}
     if X_umap_1d is not None:
@@ -554,7 +552,7 @@ def prepare(
     if not embeddings:
         raise ValueError(
             "At least one dimensional embedding must be provided. "
-            "Use X_umap_1d, X_umap_2d, X_umap_3d, or X_umap (legacy)."
+            "Use X_umap_1d, X_umap_2d, or X_umap_3d."
         )
 
     # Validate each embedding has correct dimensions
@@ -610,6 +608,7 @@ def prepare(
         normalization_info[dim] = {
             'original_range': max_range,
             'center': center.tolist(),
+            'scale_factor': scale_factor,
         }
 
     # Determine primary 3D coords for centroid computation
@@ -678,6 +677,137 @@ def prepare(
             actual_path = _write_binary(dim_path, arr, compression)
             suffix = " (gzip)" if compression else ""
             print(f"✓ Wrote {dim}D positions ({arr.shape[0]:,} cells × {dim} dims) to {actual_path}{suffix}")
+
+    # =========================================================================
+    # SAVE VECTOR FIELDS (OPTIONAL)
+    # =========================================================================
+    vector_fields_identity: Optional[dict] = None
+    if vector_fields:
+        if not isinstance(vector_fields, dict):
+            raise TypeError("vector_fields must be a dict[str, array]")
+
+        vectors_dir = out_dir / "vectors"
+        vectors_dir.mkdir(parents=True, exist_ok=True)
+
+        def _infer_vector_shape(arr: Union[np.ndarray, sparse.spmatrix], name: str) -> tuple[int, np.ndarray]:
+            dense = _to_dense(arr)
+            dense = np.asarray(dense)
+            if dense.ndim == 1:
+                dense = dense.reshape(-1, 1)
+            if dense.ndim != 2:
+                raise ValueError(f"Vector field '{name}' must be 1D or 2D array, got shape {dense.shape}")
+            if dense.shape[1] not in (1, 2, 3):
+                raise ValueError(f"Vector field '{name}' must have 1/2/3 components, got shape {dense.shape}")
+            return int(dense.shape[1]), dense
+
+        def _label_for(field_id: str) -> str:
+            base = field_id[:-5] if field_id.endswith("_umap") else field_id
+            base = base.replace("_", " ").strip()
+            titled = (base[:1].upper() + base[1:]) if base else field_id
+            return f"{titled} (UMAP)" if field_id.endswith("_umap") else titled
+
+        # First pass: collect explicit keys (<field>_<dim>d), then fill gaps with implicit keys.
+        grouped: dict[str, dict[int, Union[np.ndarray, sparse.spmatrix]]] = {}
+        explicit_dims: dict[str, set[int]] = {}
+
+        suffix_re = re.compile(r"^(.*)_([123])d$")
+        for name, arr in vector_fields.items():
+            if arr is None:
+                continue
+            key = str(name)
+            match = suffix_re.match(key)
+            if not match:
+                continue
+            field_id = match.group(1)
+            dim = int(match.group(2))
+            explicit_dims.setdefault(field_id, set()).add(dim)
+            grouped.setdefault(field_id, {})[dim] = arr
+
+        for name, arr in vector_fields.items():
+            if arr is None:
+                continue
+            key = str(name)
+            if suffix_re.match(key):
+                continue
+
+            inferred_dim, _dense = _infer_vector_shape(arr, key)
+            field_id = key
+            if inferred_dim in explicit_dims.get(field_id, set()):
+                continue  # clash-safe: explicit wins
+            grouped.setdefault(field_id, {})[inferred_dim] = arr
+
+        fields_meta: dict[str, dict] = {}
+        gz_suffix = ".gz" if compression else ""
+
+        for field_id, by_dim in grouped.items():
+            safe_id = _safe_filename_component(field_id)
+            if safe_id != field_id:
+                raise ValueError(
+                    f"Vector field id '{field_id}' contains unsupported characters. "
+                    f"Use '{safe_id}' instead."
+                )
+
+            files: dict[str, str] = {}
+            dims: list[int] = []
+
+            for dim in sorted(by_dim.keys()):
+                if dim not in embeddings:
+                    print(
+                        f"  ⚠ Skipping vector field '{field_id}' {dim}D: "
+                        f"embedding points_{dim}d not provided"
+                    )
+                    continue
+
+                inferred_dim, dense = _infer_vector_shape(by_dim[dim], f"{field_id}_{dim}d")
+                if inferred_dim != dim:
+                    raise ValueError(
+                        f"Vector field '{field_id}' declared as {dim}D but has shape {dense.shape}"
+                    )
+                if dense.shape[0] != n_cells:
+                    raise ValueError(
+                        f"Vector field '{field_id}' {dim}D has {dense.shape[0]} rows, expected {n_cells}"
+                    )
+
+                vec = np.asarray(dense, dtype=np.float32)
+                scale_factor = float(normalization_info.get(dim, {}).get("scale_factor", 1.0))
+                if scale_factor != 1.0:
+                    vec *= scale_factor
+
+                filename = f"{field_id}_{dim}d.bin"
+                path = vectors_dir / filename
+                check_path = Path(str(path) + ".gz") if compression and compression > 0 else path
+                if _file_exists_skip(check_path, check_path.name, force):
+                    pass
+                else:
+                    actual_path = _write_binary(path, vec, compression)
+                    suffix = " (gzip)" if compression else ""
+                    print(
+                        f"✓ Wrote vector field '{field_id}' {dim}D "
+                        f"({vec.shape[0]:,} cells × {dim} comps) to {actual_path}{suffix}"
+                    )
+
+                files[f"{dim}d"] = f"vectors/{filename}{gz_suffix}"
+                dims.append(dim)
+
+            if not dims:
+                continue
+
+            entry = {
+                "label": _label_for(field_id),
+                "available_dimensions": dims,
+                "default_dimension": max(dims),
+                "files": files,
+            }
+            if field_id.endswith("_umap"):
+                entry["basis"] = "umap"
+            fields_meta[field_id] = entry
+
+        if fields_meta:
+            default_field = "velocity_umap" if "velocity_umap" in fields_meta else sorted(fields_meta.keys())[0]
+            vector_fields_identity = {
+                "default_field": default_field,
+                "fields": fields_meta,
+            }
 
 
     # Decide which obs columns to export
@@ -997,7 +1127,7 @@ def prepare(
 
         if n_expr_cells != n_cells:
             raise ValueError(
-                f"gene_expression has {n_expr_cells} cells, but X_umap has {n_cells} cells."
+                f"gene_expression has {n_expr_cells} cells, but embeddings have {n_cells} cells."
             )
 
         if len(var) != n_genes:
@@ -1400,6 +1530,9 @@ def prepare(
 
     if source_info:
         identity_payload["source"] = source_info
+
+    if vector_fields_identity:
+        identity_payload["vector_fields"] = vector_fields_identity
 
     identity_path.write_text(json.dumps(identity_payload, indent=2), encoding="utf-8")
     print(f"✓ Wrote dataset identity to {identity_path}")

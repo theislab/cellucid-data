@@ -63,7 +63,24 @@ show_anndata("data.zarr")
 :::{grid-item-card} Pre-exported Data
 ```python
 from cellucid import prepare, show
-prepare(adata, "./export")
+
+# Export once (recommended for large datasets / sharing)
+X_umap = adata.obsm["X_umap"]  # shape: (n_cells, 2) or (n_cells, 3)
+
+prepare(
+    latent_space=adata.obsm.get("X_pca", X_umap),
+    obs=adata.obs,
+    var=adata.var,
+    gene_expression=adata.X,
+    connectivities=adata.obsp.get("connectivities"),
+    X_umap_2d=adata.obsm.get("X_umap_2d", X_umap if X_umap.shape[1] == 2 else None),
+    X_umap_3d=adata.obsm.get("X_umap_3d", X_umap if X_umap.shape[1] == 3 else None),
+    out_dir="./export",
+    compression=6,
+    var_quantization=8,
+    obs_continuous_quantization=8,
+)
+
 show("./export")
 ```
 :::

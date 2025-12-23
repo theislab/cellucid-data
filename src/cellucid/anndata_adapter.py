@@ -9,7 +9,7 @@ prepare first.
 Key features:
 - Works with in-memory AnnData, backed h5ad files, and zarr stores
 - Handles sparse matrices (CSR/CSC) transparently with automatic format conversion
-- Auto-detects UMAP dimensions from obsm keys (X_umap_1d, X_umap_2d, X_umap_3d, X_umap)
+- Auto-detects UMAP dimensions from explicit obsm keys (X_umap_1d, X_umap_2d, X_umap_3d) or X_umap
 - Computes centroids and outlier quantiles on-demand with caching
 - Lazy loading: gene expression and obs data are loaded on-demand
 - No quantization (full float32 precision, gzip compression for network transfer)
@@ -231,6 +231,14 @@ class AnnDataAdapter:
 
         # Caches for computed data
         self._embedding_cache: dict[int, np.ndarray] = {}
+        # Per-dimension normalization info for embeddings (center + scale_factor).
+        # Used to scale vector fields into the same normalized space as points.
+        self._embedding_norm: dict[int, dict[str, Any]] = {}
+
+        # Optional per-cell vector fields (e.g. velocity, CellRank drift).
+        # Structure matches dataset_identity.json: {"default_field": ..., "fields": {...}}.
+        self._vector_fields_metadata: Optional[dict[str, Any]] = None
+        self._vector_field_cache: dict[tuple[str, int], np.ndarray] = {}
         self._centroid_cache: dict[str, dict] = {}
         self._outlier_quantile_cache: dict[str, np.ndarray] = {}
         self._latent_space: Optional[np.ndarray] = None
@@ -248,12 +256,20 @@ class AnnDataAdapter:
         # LRU cache for gene expression values using O(1) OrderedDict
         self._gene_expression_cache = LRUCache(max_size=100)
 
+        # UMAP embedding key resolution (dimension -> obsm key)
+        self._umap_embedding_key_by_dim: dict[int, str] = {}
+        # Optional metadata for UI notifications about X_umap aliasing/clashes
+        self._umap_resolution: Optional[dict[str, Any]] = None
+
         # Track if adapter has been closed
         self._closed = False
 
         # Auto-detect available dimensions
         self._available_dimensions = self._detect_dimensions()
         self._default_dimension = self._select_default_dimension()
+
+        # Detect optional per-cell vector fields aligned to UMAP.
+        self._vector_fields_metadata = self._detect_vector_fields()
 
         # Auto-detect latent space
         if self.latent_key is None:
@@ -439,7 +455,7 @@ class AnnDataAdapter:
 
         Looks for embeddings in this order:
         1. Explicit dimension keys: X_umap_1d, X_umap_2d, X_umap_3d
-        2. Generic X_umap key (uses shape to determine dimension)
+        2. Generic key: X_umap (interpreted as 1D/2D/3D if shape matches and no clash)
 
         Returns
         -------
@@ -455,7 +471,20 @@ class AnnDataAdapter:
         if self.n_cells == 0:
             logger.warning("AnnData has 0 cells. Visualization may not work correctly.")
 
-        available = []
+        # Reset resolution metadata on each detection pass
+        self._umap_embedding_key_by_dim = {}
+        self._umap_resolution = None
+
+        available: list[int] = []
+
+        def _shape_of(arr: Any) -> tuple[int, ...]:
+            if sparse.issparse(arr):
+                return tuple(arr.shape)
+            try:
+                shape = arr.shape  # type: ignore[attr-defined]
+                return tuple(shape)
+            except Exception:
+                return tuple(np.asarray(arr).shape)
 
         # Check for explicit dimension keys first
         for dim in [1, 2, 3]:
@@ -463,10 +492,7 @@ class AnnDataAdapter:
             if key in self.adata.obsm:
                 arr = self.adata.obsm[key]
                 # Handle sparse obsm (rare but possible)
-                if sparse.issparse(arr):
-                    arr_shape = arr.shape
-                else:
-                    arr_shape = np.asarray(arr).shape
+                arr_shape = _shape_of(arr)
 
                 if len(arr_shape) != 2:
                     logger.warning(f"Key '{key}' is not 2D (shape: {arr_shape}), skipping")
@@ -478,44 +504,72 @@ class AnnDataAdapter:
                     continue
                 if arr_shape[1] == dim:
                     available.append(dim)
+                    self._umap_embedding_key_by_dim[dim] = key
                 else:
                     logger.warning(
                         f"Key '{key}' has {arr_shape[1]} columns, expected {dim}"
                     )
 
-        # If no explicit keys found, check for generic X_umap
-        if not available and "X_umap" in self.adata.obsm:
+        # Optional fallback: interpret X_umap as a dimensioned embedding when unambiguous.
+        if "X_umap" in self.adata.obsm:
             arr = self.adata.obsm["X_umap"]
-            if sparse.issparse(arr):
-                arr_shape = arr.shape
-            else:
-                arr_shape = np.asarray(arr).shape
+            arr_shape = _shape_of(arr)
 
-            if len(arr_shape) == 2 and arr_shape[0] == self.n_cells:
-                dim = arr_shape[1]
-                if dim in [1, 2, 3]:
-                    available.append(dim)
-                    logger.info(f"Detected {dim}D UMAP from 'X_umap' key (shape: {arr_shape})")
-                else:
-                    logger.warning(
-                        f"X_umap has {dim} dimensions, which is not supported (1-3 expected). "
-                        f"Consider using the first 3 dimensions or providing X_umap_3d."
-                    )
+            if len(arr_shape) != 2:
+                self._umap_resolution = {
+                    "source_key": "X_umap",
+                    "action": "ignored",
+                    "reason": "invalid_shape",
+                    "shape": list(arr_shape),
+                }
+            elif arr_shape[0] != self.n_cells:
+                self._umap_resolution = {
+                    "source_key": "X_umap",
+                    "action": "ignored",
+                    "reason": "row_count_mismatch",
+                    "shape": list(arr_shape),
+                    "expected_rows": self.n_cells,
+                }
             else:
-                logger.warning(
-                    f"X_umap has invalid shape {arr_shape}, expected ({self.n_cells}, 1-3)"
-                )
+                n_dims = int(arr_shape[1])
+                alias_key = f"X_umap_{n_dims}d"
+                if n_dims not in (1, 2, 3):
+                    self._umap_resolution = {
+                        "source_key": "X_umap",
+                        "action": "ignored",
+                        "reason": "unsupported_dim",
+                        "n_dims": n_dims,
+                    }
+                elif n_dims in self._umap_embedding_key_by_dim:
+                    # Clash: explicit key for this dimension exists; ignore X_umap.
+                    self._umap_resolution = {
+                        "source_key": "X_umap",
+                        "action": "ignored",
+                        "reason": "explicit_key_present",
+                        "dim": n_dims,
+                        "alias_key": alias_key,
+                    }
+                else:
+                    available.append(n_dims)
+                    self._umap_embedding_key_by_dim[n_dims] = "X_umap"
+                    self._umap_resolution = {
+                        "source_key": "X_umap",
+                        "action": "used_as",
+                        "dim": n_dims,
+                        "alias_key": alias_key,
+                    }
 
         if not available:
             raise ValueError(
                 "No valid UMAP embeddings found in adata.obsm. "
-                "Expected keys: 'X_umap_1d', 'X_umap_2d', 'X_umap_3d', or 'X_umap'. "
+                "Expected keys: 'X_umap_1d', 'X_umap_2d', 'X_umap_3d', or 'X_umap' (1D/2D/3D). "
                 f"Available obsm keys: {list(self.adata.obsm.keys())}. "
                 "Please add UMAP coordinates to your AnnData object using scanpy.tl.umap() "
-                "or manually setting adata.obsm['X_umap'] = coordinates."
+                "and then store explicit embeddings under X_umap_1d / X_umap_2d / X_umap_3d."
             )
 
-        return sorted(available)
+        # Ensure uniqueness and stable ordering.
+        return sorted(set(available))
 
     def _select_default_dimension(self) -> int:
         """Select default dimension (prefer 3D > 2D > 1D)."""
@@ -523,6 +577,140 @@ class AnnDataAdapter:
             if dim in self._available_dimensions:
                 return dim
         return self._available_dimensions[0]
+
+    def _detect_vector_fields(self) -> Optional[dict[str, Any]]:
+        """
+        Detect per-cell vector fields in `adata.obsm` aligned to UMAP.
+
+        Naming convention (UMAP basis):
+        - Explicit: `<field>_umap_<dim>d` (preferred)
+          - Examples: `velocity_umap_2d`, `T_fwd_umap_3d`
+        - Implicit: `<field>_umap` with shape `(n_cells, 1|2|3)`
+          - Used only if the explicit key for that dim is not present (clash-safe)
+
+        Returns a structure suitable for dataset_identity.json under `vector_fields`,
+        including per-field `files` entries pointing at server-served binaries:
+        `vectors/<fieldId>_<dim>d.bin`.
+        """
+        keys = list(self.adata.obsm.keys())
+        if not keys:
+            return None
+
+        def _shape_of(arr: Any) -> tuple[int, ...]:
+            if sparse.issparse(arr):
+                return tuple(arr.shape)
+            try:
+                shape = arr.shape  # type: ignore[attr-defined]
+                return tuple(shape)
+            except Exception:
+                return tuple(np.asarray(arr).shape)
+
+        suffix_re = re.compile(r"^(.*)_([123])d$")
+
+        # Internal working structure: fieldId -> {dims:set, explicit:set, obsm_keys:dict[str,str]}
+        fields: dict[str, dict[str, Any]] = {}
+
+        def _ensure(field_id: str) -> dict[str, Any]:
+            if field_id not in fields:
+                fields[field_id] = {"dims": set(), "explicit": set(), "obsm_keys": {}}
+            return fields[field_id]
+
+        # 1) Explicit per-dimension keys.
+        for key in keys:
+            match = suffix_re.match(key)
+            if not match:
+                continue
+            field_id = match.group(1)
+            dim = int(match.group(2))
+
+            if not field_id.endswith("_umap"):
+                continue
+            if field_id.startswith("X_"):
+                continue  # reserved for embeddings
+            if dim not in (1, 2, 3):
+                continue
+            if dim not in self._available_dimensions:
+                continue  # can't render a dim that doesn't exist in points
+
+            arr = self.adata.obsm.get(key)
+            if arr is None:
+                continue
+            shape = _shape_of(arr)
+            if len(shape) != 2 or shape[0] != self.n_cells or shape[1] != dim:
+                continue
+
+            entry = _ensure(field_id)
+            entry["obsm_keys"][f"{dim}d"] = key
+            entry["dims"].add(dim)
+            entry["explicit"].add(dim)
+
+        # 2) Implicit keys (<field>_umap), shape-derived, clash-safe.
+        for key in keys:
+            field_id = key
+            if not field_id.endswith("_umap"):
+                continue
+            if field_id.startswith("X_"):
+                continue
+            if suffix_re.match(field_id):
+                continue  # skip explicit keys
+
+            arr = self.adata.obsm.get(field_id)
+            if arr is None:
+                continue
+            shape = _shape_of(arr)
+            if len(shape) == 1:
+                if shape[0] != self.n_cells:
+                    continue
+                dim = 1
+            elif len(shape) == 2:
+                if shape[0] != self.n_cells:
+                    continue
+                dim = int(shape[1])
+            else:
+                continue
+
+            if dim not in (1, 2, 3):
+                continue
+            if dim not in self._available_dimensions:
+                continue
+
+            entry = _ensure(field_id)
+            if dim in entry["explicit"]:
+                continue  # clash-safe: explicit wins
+            slot = f"{dim}d"
+            if slot not in entry["obsm_keys"]:
+                entry["obsm_keys"][slot] = field_id
+                entry["dims"].add(dim)
+
+        if not fields:
+            return None
+
+        def _label_for(field_id: str) -> str:
+            base = field_id[:-5] if field_id.endswith("_umap") else field_id
+            base = base.replace("_", " ").strip()
+            titled = (base[:1].upper() + base[1:]) if base else field_id
+            return f"{titled} (UMAP)" if field_id.endswith("_umap") else titled
+
+        fields_out: dict[str, Any] = {}
+        for field_id, entry in fields.items():
+            dims = sorted(entry["dims"])
+            if not dims:
+                continue
+            files = {f"{d}d": f"vectors/{field_id}_{d}d.bin" for d in dims}
+            fields_out[field_id] = {
+                "label": _label_for(field_id),
+                "basis": "umap",
+                "available_dimensions": dims,
+                "default_dimension": max(dims),
+                "files": files,
+                "obsm_keys": entry["obsm_keys"],
+            }
+
+        if not fields_out:
+            return None
+
+        default_field = "velocity_umap" if "velocity_umap" in fields_out else sorted(fields_out.keys())[0]
+        return {"default_field": default_field, "fields": fields_out}
 
     def _detect_latent_key(self) -> Optional[str]:
         """Auto-detect latent space key from obsm."""
@@ -562,17 +750,13 @@ class AnnDataAdapter:
             return self._embedding_cache[dim]
 
         # Get raw embedding
-        key = f"X_umap_{dim}d"
-        if key in self.adata.obsm:
-            raw = _to_dense_2d(self.adata.obsm[key])
-        elif "X_umap" in self.adata.obsm:
-            x_umap = self.adata.obsm["X_umap"]
-            if x_umap.shape[1] == dim:
-                raw = _to_dense_2d(x_umap)
-            else:
-                raise ValueError(f"Could not find embedding for dimension {dim}")
-        else:
-            raise ValueError(f"Could not find embedding for dimension {dim}")
+        key = self._umap_embedding_key_by_dim.get(dim)
+        if not key or key not in self.adata.obsm:
+            raise ValueError(
+                f"Could not find embedding for dimension {dim}. "
+                f"Expected an embedding resolved for {dim}D. Available obsm keys: {list(self.adata.obsm.keys())}"
+            )
+        raw = _to_dense_2d(self.adata.obsm[key])
 
         raw = raw.astype(np.float32)
 
@@ -587,6 +771,15 @@ class AnnDataAdapter:
             center = (axis_mins + axis_maxs) / 2
             scale_factor = 2.0 / max_range
             raw = ((raw - center) * scale_factor).astype(np.float32)
+            self._embedding_norm[dim] = {
+                "center": center.astype(np.float32),
+                "scale_factor": float(scale_factor),
+            }
+        else:
+            self._embedding_norm[dim] = {
+                "center": np.zeros((dim,), dtype=np.float32),
+                "scale_factor": 1.0,
+            }
 
         self._embedding_cache[dim] = raw
         return raw
@@ -620,6 +813,56 @@ class AnnDataAdapter:
         embedding = self.get_embedding(dim)
         data = embedding.astype(np.float32).tobytes()
 
+        if compress:
+            return gzip.compress(data, compresslevel=6)
+        return data
+
+    def get_vector_field_binary(self, field_id: str, dim: int, compress: bool = False) -> bytes:
+        """
+        Get a per-cell vector field (displacement vectors) as binary float32 data.
+
+        Vector fields are scaled by the SAME per-dimension normalization scale as
+        the embedding points, so they are in the same normalized space as the
+        `points_{dim}d.bin` responses.
+        """
+        self._check_closed()
+
+        field = str(field_id or "")
+        d = int(dim)
+        if d not in (1, 2, 3):
+            raise ValueError(f"Invalid dimension {dim}. Expected 1, 2, or 3.")
+
+        meta = self._vector_fields_metadata or {}
+        fields = meta.get("fields") or {}
+        entry = fields.get(field)
+        if not entry:
+            raise ValueError(f"Vector field '{field}' not available")
+
+        obsm_keys = entry.get("obsm_keys") or {}
+        obsm_key = obsm_keys.get(f"{d}d")
+        if not obsm_key or obsm_key not in self.adata.obsm:
+            raise ValueError(f"Vector field '{field}' does not provide {d}D data")
+
+        cache_key = (field, d)
+        if cache_key not in self._vector_field_cache:
+            # Ensure embedding normalization scale is computed.
+            self.get_embedding(d)
+            scale_factor = float(self._embedding_norm.get(d, {}).get("scale_factor", 1.0))
+
+            raw = _to_dense_2d(self.adata.obsm[obsm_key]).astype(np.float32)
+            if raw.ndim == 1:
+                raw = raw.reshape(-1, 1)
+            if raw.ndim != 2 or raw.shape[0] != self.n_cells or raw.shape[1] != d:
+                raise ValueError(
+                    f"Vector field '{obsm_key}' has shape {tuple(raw.shape)}, expected ({self.n_cells}, {d})"
+                )
+
+            if self.normalize_embeddings and scale_factor != 1.0:
+                raw *= scale_factor
+
+            self._vector_field_cache[cache_key] = raw
+
+        data = self._vector_field_cache[cache_key].tobytes()
         if compress:
             return gzip.compress(data, compresslevel=6)
         return data
@@ -1169,6 +1412,8 @@ class AnnDataAdapter:
             "default_dimension": self._default_dimension,
             "files": {f"{dim}d": f"points_{dim}d.bin" for dim in self._available_dimensions}
         }
+        if self._umap_resolution is not None:
+            embeddings_meta["umap_resolution"] = self._umap_resolution
 
         # Build obs field summaries
         obs_fields = []
@@ -1181,7 +1426,7 @@ class AnnDataAdapter:
                 entry["n_categories"] = len(cat.cat.categories)
             obs_fields.append(entry)
 
-        return {
+        identity = {
             "version": 2,
             "id": self.dataset_id,
             "name": self.dataset_name,
@@ -1218,6 +1463,11 @@ class AnnDataAdapter:
             # Special flag to indicate this is from AnnData adapter
             "_anndata_adapter": True,
         }
+
+        if self._vector_fields_metadata:
+            identity["vector_fields"] = self._vector_fields_metadata
+
+        return identity
 
     def get_obs_manifest(self) -> dict:
         """Generate obs_manifest.json content."""
@@ -1261,14 +1511,14 @@ class AnnDataAdapter:
         # at the HTTP level when client supports Accept-Encoding: gzip
         obs_schemas = {
             "continuous": {
-                "pathPattern": "obs/{key}.values.f32.bin",
+                "pathPattern": "obs/{key}.values.f32",
                 "ext": "f32",
                 "dtype": "float32",
                 "quantized": False,
             },
             "categorical": {
-                "codesPathPattern": "obs/{key}.codes.{ext}.bin",
-                "outlierPathPattern": "obs/{key}.outliers.f32.bin",
+                "codesPathPattern": "obs/{key}.codes.{ext}",
+                "outlierPathPattern": "obs/{key}.outliers.f32",
                 "outlierExt": "f32",
                 "outlierDtype": "float32",
                 "outlierQuantized": False,
@@ -1300,7 +1550,7 @@ class AnnDataAdapter:
         # at the HTTP level when client supports Accept-Encoding: gzip
         var_schema = {
             "kind": "continuous",
-            "pathPattern": "var/{key}.values.f32.bin",
+            "pathPattern": "var/{key}.values.f32",
             "ext": "f32",
             "dtype": "float32",
             "quantized": False,
@@ -1399,6 +1649,9 @@ class AnnDataAdapter:
 
         # Clear all caches to free memory
         self._embedding_cache.clear()
+        self._embedding_norm.clear()
+        self._vector_field_cache.clear()
+        self._vector_fields_metadata = None
         self._centroid_cache.clear()
         self._outlier_quantile_cache.clear()
         self._gene_expression_cache.clear()

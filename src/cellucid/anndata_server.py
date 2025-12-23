@@ -65,6 +65,7 @@ class AnnDataRequestHandler(CORSMixin, SimpleHTTPRequestHandler):
         /var_manifest.json - Gene expression manifest
         /connectivity_manifest.json - Connectivity manifest
         /points_{dim}d.bin - Embedding coordinates
+        /vectors/{fieldId}_{dim}d.bin - Vector field displacement vectors
         /obs/{field}.values.f32.bin - Continuous obs field
         /obs/{field}.codes.{ext}.bin - Categorical obs field codes
         /obs/{field}.outliers.f32.bin - Categorical outlier quantiles
@@ -129,7 +130,8 @@ class AnnDataRequestHandler(CORSMixin, SimpleHTTPRequestHandler):
                     "status": "ok",
                     "type": "anndata",
                     "version": self.server_info.get("version", "unknown"),
-                    "data_source": self.server_info.get("data_source", "unknown"),
+                    "format": self.server_info.get("format", "unknown"),
+                    "is_backed": self.server_info.get("is_backed", False),
                     "n_cells": self.adapter.n_cells,
                     "n_genes": self.adapter.n_genes,
                 }, head_only)
@@ -164,12 +166,14 @@ class AnnDataRequestHandler(CORSMixin, SimpleHTTPRequestHandler):
                 self._handle_var(path, head_only, supports_gzip)
             elif path.startswith("connectivity/"):
                 self._handle_connectivity(path, head_only, supports_gzip)
+            elif path.startswith("vectors/"):
+                self._handle_vector_fields(path, head_only, supports_gzip)
             else:
                 self.send_error_response(404, f"Not found: {path}")
 
-        except Exception as e:
-            logger.error(f"Error handling {path}: {e}", exc_info=True)
-            self.send_error_response(500, str(e))
+        except Exception:
+            logger.exception("Error handling %s", path)
+            self.send_error_response(500, "Internal server error")
 
     def _handle_points(self, path: str, head_only: bool, supports_gzip: bool):
         """Handle points_Xd.bin requests."""
@@ -187,6 +191,35 @@ class AnnDataRequestHandler(CORSMixin, SimpleHTTPRequestHandler):
             compress = supports_gzip
             data = self.adapter.get_points_binary(dim, compress=compress)
             self.send_binary(data, head_only=head_only, compressed=compress)
+        except ValueError:
+            self.send_error_response(404, "Points data not available")
+
+    def _handle_vector_fields(self, path: str, head_only: bool, supports_gzip: bool):
+        """
+        Handle vector field requests under /vectors/.
+
+        Supported paths:
+        - vectors/{fieldId}_{dim}d.bin
+        - vectors/{fieldId}_{dim}d.bin.gz  (raw gzip bytes, no Content-Encoding)
+        """
+        raw_gz = path.endswith(".gz")
+        clean_path = path[:-3] if raw_gz else path
+        match = re.match(r"vectors/(.+)_([123])d\.bin$", clean_path)
+        if not match:
+            self.send_error_response(404, f"Invalid vectors path: {path}")
+            return
+
+        field_id = match.group(1)
+        dim = int(match.group(2))
+
+        try:
+            if raw_gz:
+                data = self.adapter.get_vector_field_binary(field_id, dim, compress=True)
+                self.send_binary(data, head_only=head_only, compressed=False)
+            else:
+                compress = supports_gzip
+                data = self.adapter.get_vector_field_binary(field_id, dim, compress=compress)
+                self.send_binary(data, head_only=head_only, compressed=compress)
         except ValueError as e:
             self.send_error_response(404, str(e))
 
@@ -194,9 +227,8 @@ class AnnDataRequestHandler(CORSMixin, SimpleHTTPRequestHandler):
         """
         Handle obs field requests.
 
-        Supports paths in both formats for compatibility:
-        - obs/{field}.values.f32 (prepare format)
-        - obs/{field}.values.f32.bin (legacy format)
+        Supported paths:
+        - obs/{field}.values.f32
         - obs/{field}.codes.u8 or obs/{field}.codes.u16
         - obs/{field}.outliers.f32
         """
@@ -206,8 +238,6 @@ class AnnDataRequestHandler(CORSMixin, SimpleHTTPRequestHandler):
         # Strip suffixes for parsing
         if filename.endswith(".gz"):
             filename = filename[:-3]
-        if filename.endswith(".bin"):
-            filename = filename[:-4]
 
         # Compress if client supports gzip (transparent compression)
         compress = supports_gzip
@@ -249,16 +279,16 @@ class AnnDataRequestHandler(CORSMixin, SimpleHTTPRequestHandler):
                 self.send_binary(data, head_only=head_only, compressed=compress)
             else:
                 self.send_error_response(404, f"Unknown obs data type: {data_type} (expected values, codes, or outliers)")
-        except Exception as e:
-            self.send_error_response(500, str(e))
+        except Exception:
+            logger.exception("Error handling obs request: %s", path)
+            self.send_error_response(500, "Internal server error")
 
     def _handle_var(self, path: str, head_only: bool, supports_gzip: bool):
         """
         Handle var (gene expression) requests.
 
-        Supports paths in both formats for compatibility:
-        - var/{gene}.values.f32 (prepare format)
-        - var/{gene}.values.f32.bin (legacy format)
+        Supported paths:
+        - var/{gene}.values.f32
         """
         # Remove 'var/' prefix
         filename = path[4:]
@@ -266,8 +296,6 @@ class AnnDataRequestHandler(CORSMixin, SimpleHTTPRequestHandler):
         # Strip suffixes for parsing
         if filename.endswith(".gz"):
             filename = filename[:-3]
-        if filename.endswith(".bin"):
-            filename = filename[:-4]
 
         # Compress if client supports gzip (transparent compression)
         compress = supports_gzip
@@ -300,10 +328,11 @@ class AnnDataRequestHandler(CORSMixin, SimpleHTTPRequestHandler):
         try:
             data = self.adapter.get_gene_expression(actual_gene, compress=compress)
             self.send_binary(data, head_only=head_only, compressed=compress)
-        except KeyError as e:
-            self.send_error_response(404, str(e))
-        except Exception as e:
-            self.send_error_response(500, str(e))
+        except KeyError:
+            self.send_error_response(404, "Gene not found")
+        except Exception:
+            logger.exception("Error handling var request: %s", path)
+            self.send_error_response(500, "Internal server error")
 
     def _handle_connectivity(self, path: str, head_only: bool, supports_gzip: bool):
         """
@@ -331,10 +360,11 @@ class AnnDataRequestHandler(CORSMixin, SimpleHTTPRequestHandler):
                 self.send_binary(dests_data, head_only=head_only, compressed=compress)
             else:
                 self.send_error_response(404, f"Unknown connectivity file: {filename} (expected edges.src.bin or edges.dst.bin)")
-        except ValueError as e:
-            self.send_error_response(404, str(e))
-        except Exception as e:
-            self.send_error_response(500, str(e))
+        except ValueError:
+            self.send_error_response(404, "Connectivity data not available")
+        except Exception:
+            logger.exception("Error handling connectivity request: %s", path)
+            self.send_error_response(500, "Internal server error")
 
     def log_message(self, format: str, *args):
         """Override to use Python logging."""
@@ -393,6 +423,7 @@ class AnnDataServer:
             is_zarr = str(data).endswith('.zarr') or data_path.is_dir()
             format_name = "zarr" if is_zarr else "h5ad"
             self.data_source = str(data)
+            self.data_format = format_name
 
             if not quiet:
                 print_step(1, 4, "Detecting format")
@@ -402,6 +433,7 @@ class AnnDataServer:
         else:
             # In-memory AnnData
             self.data_source = "in-memory AnnData"
+            self.data_format = "in-memory"
             if not quiet:
                 print_step(1, 4, "Detecting format")
                 print_detail("Source", "in-memory AnnData")
@@ -441,7 +473,7 @@ class AnnDataServer:
         self.server_info = {
             "version": __version__,
             "type": "anndata",
-            "data_source": self.data_source,
+            "format": self.data_format,
             "host": self.host,
             "port": self.port,
             "n_cells": self.adapter.n_cells,
@@ -631,93 +663,3 @@ def serve_anndata(
     )
     server.start()
     return server
-
-
-def main():
-    """CLI entry point for cellucid serve-anndata (legacy, kept for direct imports)."""
-    import argparse
-
-    parser = argparse.ArgumentParser(
-        description="Serve AnnData (h5ad or zarr) directly for visualization",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-    # Serve an h5ad file
-    cellucid serve-anndata /path/to/data.h5ad
-
-    # Serve a zarr store
-    cellucid serve-anndata /path/to/data.zarr
-
-    # Serve on a different port
-    cellucid serve-anndata /path/to/data.h5ad --port 9000
-
-Supported formats:
-    - .h5ad files: HDF5-based AnnData files
-    - .zarr directories: Zarr-based AnnData stores
-
-Note:
-    This serves data directly from AnnData, which is slower than using
-    pre-exported data. For production use, export your data first,
-    then serve the exported directory with:
-        cellucid serve /path/to/export/
-""",
-    )
-
-    parser.add_argument(
-        "anndata_path",
-        type=str,
-        help="Path to h5ad file or zarr directory",
-    )
-    parser.add_argument(
-        "--port", "-p",
-        type=int,
-        default=DEFAULT_PORT,
-        help=f"Port to serve on (default: {DEFAULT_PORT})",
-    )
-    parser.add_argument(
-        "--host", "-H",
-        type=str,
-        default=DEFAULT_HOST,
-        help=f"Host to bind to (default: {DEFAULT_HOST})",
-    )
-    parser.add_argument(
-        "--no-browser",
-        action="store_true",
-        help="Don't open browser automatically",
-    )
-    parser.add_argument(
-        "--quiet", "-q",
-        action="store_true",
-        help="Suppress info messages",
-    )
-    parser.add_argument(
-        "--no-backed",
-        action="store_true",
-        help="Load entire file into memory (default: lazy loading for h5ad)",
-    )
-    parser.add_argument(
-        "--latent-key",
-        type=str,
-        default=None,
-        help="Key in obsm for latent space (auto-detected if not specified)",
-    )
-
-    args = parser.parse_args()
-
-    # Configure logging
-    if not args.quiet:
-        logging.basicConfig(level=logging.INFO)
-
-    serve_anndata(
-        data=args.anndata_path,
-        port=args.port,
-        host=args.host,
-        open_browser=not args.no_browser,
-        quiet=args.quiet,
-        backed=not args.no_backed,
-        latent_key=args.latent_key,
-    )
-
-
-if __name__ == "__main__":
-    main()

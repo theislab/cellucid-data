@@ -164,9 +164,44 @@ class CORSMixin:
     # Override in subclass: whether to allow caching
     allow_caching: bool = True
 
+    def _get_allowed_origin(self) -> str | None:
+        origin = self.headers.get("Origin")
+        if not origin:
+            return None
+
+        from urllib.parse import urlparse
+
+        try:
+            parsed = urlparse(origin)
+        except Exception:
+            return None
+
+        if parsed.scheme not in ("http", "https"):
+            return None
+
+        host = parsed.hostname
+        if not host:
+            return None
+
+        if host in ("localhost", "127.0.0.1"):
+            return origin
+
+        # Allow the canonical hosted viewer origin.
+        if origin == CELLUCID_WEB_URL:
+            return origin
+
+        # Allow https subdomains under cellucid.com (optional, but safe).
+        if parsed.scheme == "https" and (host == "cellucid.com" or host.endswith(".cellucid.com")):
+            return origin
+
+        return None
+
     def add_cors_headers(self):
         """Add CORS headers to the response."""
-        self.send_header("Access-Control-Allow-Origin", "*")
+        allowed_origin = self._get_allowed_origin()
+        if allowed_origin:
+            self.send_header("Access-Control-Allow-Origin", allowed_origin)
+            self.send_header("Vary", "Origin")
         self.send_header("Access-Control-Allow-Methods", "GET, HEAD, POST, OPTIONS")
         self.send_header("Access-Control-Allow-Headers", "Content-Type, Range")
         self.send_header("Access-Control-Expose-Headers", "Content-Length, Content-Range")
@@ -218,7 +253,8 @@ class CORSMixin:
         self.send_header("Content-Length", len(body))
         # Note: CORS headers are added by end_headers() override in subclasses
         self.end_headers()
-        self.wfile.write(body)
+        if getattr(self, "command", "") != "HEAD":
+            self.wfile.write(body)
 
     def handle_event_post(self) -> bool:
         """
@@ -261,8 +297,8 @@ class CORSMixin:
 
         except json.JSONDecodeError as e:
             self.send_json({"status": "error", "message": f"Invalid JSON: {e}"})
-        except Exception as e:
-            logger.error(f"Error handling event POST: {e}")
-            self.send_error_response(500, str(e))
+        except Exception:
+            logger.exception("Error handling event POST")
+            self.send_error_response(500, "Internal server error")
 
         return True

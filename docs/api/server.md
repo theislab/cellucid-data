@@ -66,7 +66,18 @@ Serve a pre-exported Cellucid dataset via HTTP. Use this when you've already run
 ```python
 from cellucid import prepare, serve
 
-prepare(adata, "./my_export")
+# Export once (see `cellucid.prepare` docs for full options)
+X_umap = adata.obsm["X_umap"]
+prepare(
+    latent_space=adata.obsm.get("X_pca", X_umap),
+    obs=adata.obs,
+    var=adata.var,
+    gene_expression=adata.X,
+    X_umap_2d=adata.obsm.get("X_umap_2d", X_umap if X_umap.shape[1] == 2 else None),
+    X_umap_3d=adata.obsm.get("X_umap_3d", X_umap if X_umap.shape[1] == 3 else None),
+    out_dir="./my_export",
+    compression=6,
+)
 serve("./my_export")
 ```
 

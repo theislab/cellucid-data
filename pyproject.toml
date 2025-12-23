@@ -71,8 +71,6 @@ docs = [
 [project.scripts]
 # Main unified CLI entry point
 cellucid = "cellucid.cli:main"
-# Legacy backwards-compatible entry point (deprecated, use 'cellucid serve-anndata' instead)
-cellucid-anndata = "cellucid.cli:main_anndata_legacy"
 
 [project.urls]
 Homepage = "https://github.com/theislab/cellucid-python"

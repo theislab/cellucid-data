@@ -2,16 +2,12 @@
 Cellucid CLI - Unified Command Line Interface
 
 This module provides a single entry point for all cellucid command-line operations:
-- serve: Serve pre-exported cellucid datasets
-- serve-anndata: Serve AnnData (h5ad/zarr) directly without pre-export
+- serve: Serve data (auto-detects h5ad, zarr, or pre-exported)
 
 Usage:
     cellucid serve /path/to/exported_data
-    cellucid serve-anndata /path/to/data.h5ad
+    cellucid serve /path/to/data.h5ad
     cellucid --version
-
-The CLI consolidates the previously separate `cellucid` and `cellucid-anndata`
-commands into a single unified interface with subcommands.
 """
 
 from __future__ import annotations
@@ -31,8 +27,8 @@ def _create_common_server_parser() -> argparse.ArgumentParser:
     """
     Create a parent parser with common server arguments.
 
-    This parser is shared by both 'serve' and 'serve-anndata' subcommands
-    to ensure consistent behavior and reduce code duplication.
+    This parser is shared by server subcommands to ensure consistent behavior
+    and reduce code duplication.
     """
     parser = argparse.ArgumentParser(add_help=False)
 
@@ -157,49 +153,6 @@ Examples:
 
     serve_parser.set_defaults(func=_run_serve)
 
-
-def _add_serve_anndata_subparser(subparsers, common_parser: argparse.ArgumentParser) -> None:
-    """Add the 'serve-anndata' subcommand (deprecated, kept for backwards compatibility)."""
-    anndata_parser = subparsers.add_parser(
-        "serve-anndata",
-        parents=[common_parser],
-        help="[Deprecated] Use 'cellucid serve' instead (auto-detects format)",
-        description="Serve AnnData directly. DEPRECATED: Use 'cellucid serve' instead.",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-DEPRECATED: This command is deprecated. Use 'cellucid serve' instead.
-The 'serve' command now auto-detects h5ad, zarr, and pre-exported formats.
-
-Examples:
-    # Old way (deprecated):
-    cellucid serve-anndata /path/to/data.h5ad
-
-    # New way (recommended):
-    cellucid serve /path/to/data.h5ad
-""",
-    )
-
-    anndata_parser.add_argument(
-        "anndata_path",
-        type=str,
-        help="Path to h5ad file or zarr directory",
-    )
-    anndata_parser.add_argument(
-        "--no-backed",
-        action="store_true",
-        help="Load entire file into memory (default: lazy loading for h5ad)",
-    )
-    anndata_parser.add_argument(
-        "--latent-key",
-        type=str,
-        default=None,
-        metavar="KEY",
-        help="Key in obsm for latent space (auto-detected if not specified)",
-    )
-
-    anndata_parser.set_defaults(func=_run_serve_anndata)
-
-
 def _run_serve(args: argparse.Namespace) -> None:
     """Execute the 'serve' subcommand with auto-detection."""
     # Configure logging based on args
@@ -253,37 +206,6 @@ def _run_serve(args: argparse.Namespace) -> None:
             backed=not args.no_backed,
             latent_key=args.latent_key,
         )
-
-
-def _run_serve_anndata(args: argparse.Namespace) -> None:
-    """Execute the 'serve-anndata' subcommand."""
-    # Configure logging based on args
-    _configure_logging(args)
-
-    if not args.quiet:
-        try:
-            from . import __version__
-        except ImportError:
-            __version__ = "0.0.0"
-        print(f"cellucid v{__version__}")
-        print("\nImporting dependencies (anndata, numpy, scipy)...", end=" ", flush=True)
-
-    # Import here to avoid circular imports and speed up CLI startup
-    # This import is slow because it loads anndata/numpy/scipy
-    from .anndata_server import serve_anndata
-
-    if not args.quiet:
-        print("done")
-
-    serve_anndata(
-        data=args.anndata_path,
-        port=args.port,
-        host=args.host,
-        open_browser=not args.no_browser,
-        quiet=args.quiet,
-        backed=not args.no_backed,
-        latent_key=args.latent_key,
-    )
 
 
 def _configure_logging(args: argparse.Namespace) -> None:
@@ -354,7 +276,6 @@ Use 'cellucid serve --help' for more options.
 
     # Add subcommands
     _add_serve_subparser(subparsers, common_parser)
-    _add_serve_anndata_subparser(subparsers, common_parser)
 
     return parser
 
@@ -404,71 +325,6 @@ def main(args: list[str] | None = None) -> int:
         logger.exception("Unexpected error")
         print(f"Error: {e}", file=sys.stderr)
         return 1
-
-
-# =============================================================================
-# DEPRECATED: Legacy entry points for backwards compatibility
-# =============================================================================
-# These functions maintain backwards compatibility with the old CLI commands.
-# They will be removed in a future version.
-
-def main_serve_legacy() -> int:
-    """
-    Legacy entry point for 'cellucid' command.
-
-    This is a backwards-compatible wrapper that redirects to the new CLI.
-    Users should migrate to 'cellucid serve <path>' instead.
-
-    .. deprecated::
-        Use 'cellucid serve <path>' instead.
-    """
-    import sys
-
-    # If we have arguments, inject 'serve' as the command
-    if len(sys.argv) > 1:
-        # Check if user is trying to use --help without a path
-        if sys.argv[1] in ('-h', '--help'):
-            # Show the serve subcommand help
-            return main(['serve', '--help'])
-        elif sys.argv[1].startswith('-'):
-            # Flags before path - need to handle properly
-            # Find where the path is and inject 'serve' before everything
-            return main(['serve'] + sys.argv[1:])
-        else:
-            # Path is first argument - inject 'serve' before it
-            return main(['serve'] + sys.argv[1:])
-    else:
-        # No arguments - show general help
-        parser = create_parser()
-        parser.print_help()
-        print("\n" + "=" * 60)
-        print("NOTE: The 'cellucid' command now requires a subcommand.")
-        print("Use 'cellucid serve <path>' to serve pre-exported data.")
-        print("=" * 60)
-        return 0
-
-
-def main_anndata_legacy() -> int:
-    """
-    Legacy entry point for 'cellucid-anndata' command.
-
-    This is a backwards-compatible wrapper that redirects to the new CLI.
-    Users should migrate to 'cellucid serve-anndata <path>' instead.
-
-    .. deprecated::
-        Use 'cellucid serve-anndata <path>' instead.
-    """
-    import sys
-
-    # Inject 'serve-anndata' as the command
-    if len(sys.argv) > 1:
-        if sys.argv[1] in ('-h', '--help'):
-            return main(['serve-anndata', '--help'])
-        else:
-            return main(['serve-anndata'] + sys.argv[1:])
-    else:
-        # No arguments - show serve-anndata help
-        return main(['serve-anndata', '--help'])
 
 
 if __name__ == "__main__":
